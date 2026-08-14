@@ -25,6 +25,7 @@ func All() []any {
 		&Cart{}, &CartItem{},
 		&Favorite{}, &FavoriteItem{},
 		&Order{}, &OrderItem{}, &OrderEvent{}, &OrderReward{}, &OrderVoucher{},
+		&Notification{},
 	}
 }
 

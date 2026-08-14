@@ -19,8 +19,19 @@ import (
 	"service_nusantara/internal/auth"
 	"service_nusantara/internal/config"
 	"service_nusantara/internal/middleware"
+	"service_nusantara/internal/modules/banner"
+	"service_nusantara/internal/modules/cashier"
+	"service_nusantara/internal/modules/customeraddress"
+	"service_nusantara/internal/modules/event"
 	"service_nusantara/internal/modules/health"
+	"service_nusantara/internal/modules/notification"
+	"service_nusantara/internal/modules/product"
+	"service_nusantara/internal/modules/role"
+	"service_nusantara/internal/modules/shop"
+	"service_nusantara/internal/modules/typeproduct"
 	"service_nusantara/internal/modules/user"
+	"service_nusantara/internal/modules/voucher"
+	"service_nusantara/internal/platform/storage"
 )
 
 // apiPrefix is the single place the API version is declared.
@@ -73,10 +84,20 @@ func New(cfg config.Config, db *gorm.DB, rdb *redis.Client, log *slog.Logger) *S
 	authenticate := middleware.Authenticate(tokens, sessions)
 	limiter := middleware.NewRateLimiter(rdb, cfg.Limiter.Requests, cfg.Limiter.Window)
 
+	images, imagesErr := imageUploader(cfg.Storage)
+	if imagesErr != nil {
+		// Not fatal: the API is still useful for everything that does not
+		// upload, and saying so once at startup beats a mystery 503 later.
+		log.Warn("image uploads disabled", slog.String("reason", imagesErr.Error()))
+	}
+
+	limit := limiter.Limit(cfg.HTTP.TrustProxyHeaders)
+
 	mux := http.NewServeMux()
 	health.NewHandler(db, rdb, cfg.App.Version).Register(mux)
-	user.Register(mux, apiPrefix, user.NewHandler(userService), authenticate,
-		limiter.Limit(cfg.HTTP.TrustProxyHeaders))
+	user.Register(mux, apiPrefix, user.NewHandler(userService), authenticate, limit)
+
+	registerCatalogModules(mux, db, images, hasher, log, authenticate, limit)
 
 	// Outermost first: an id and a logger must exist before anything can panic,
 	// and Recover must wrap everything that follows.
@@ -148,4 +169,49 @@ func (s *Server) Run(ctx context.Context) error {
 		s.log.Info("http server stopped cleanly")
 		return nil
 	}
+}
+
+// registerCatalogModules mounts every CRUD module.
+//
+// They are grouped here rather than inline above so adding one is a single
+// line, and so the shared dependencies are constructed once.
+func registerCatalogModules(
+	mux *http.ServeMux,
+	db *gorm.DB,
+	images storage.Uploader,
+	// hasher is threaded through because creating a cashier creates a user
+	// account; hardcoding a bcrypt cost here would silently ignore BCRYPT_COST.
+	hasher *auth.Hasher,
+	log *slog.Logger,
+	authenticate, limit middleware.Middleware,
+) {
+	typeProductService := typeproduct.NewService(typeproduct.NewGormRepository(db), images, log)
+	typeproduct.Register(mux, apiPrefix, typeproduct.NewHandler(typeProductService), authenticate, limit)
+
+	productService := product.NewService(product.NewGormRepository(db), images, log)
+	product.Register(mux, apiPrefix, product.NewHandler(productService), authenticate, limit)
+
+	shopService := shop.NewService(shop.NewGormRepository(db), images, log)
+	shop.Register(mux, apiPrefix, shop.NewHandler(shopService), authenticate, limit)
+
+	bannerService := banner.NewService(banner.NewGormRepository(db), images, log)
+	banner.Register(mux, apiPrefix, banner.NewHandler(bannerService), authenticate, limit)
+
+	cashierService := cashier.NewService(cashier.NewGormRepository(db), images, hasher, log)
+	cashier.Register(mux, apiPrefix, cashier.NewHandler(cashierService), authenticate, limit)
+
+	eventService := event.NewService(event.NewGormRepository(db), images, log)
+	event.Register(mux, apiPrefix, event.NewHandler(eventService), authenticate, limit)
+
+	voucherService := voucher.NewService(voucher.NewGormRepository(db), log)
+	voucher.Register(mux, apiPrefix, voucher.NewHandler(voucherService), authenticate, limit)
+
+	roleService := role.NewService(role.NewGormRepository(db), log)
+	role.Register(mux, apiPrefix, role.NewHandler(roleService), authenticate, limit)
+
+	notificationService := notification.NewService(notification.NewGormRepository(db), log)
+	notification.Register(mux, apiPrefix, notification.NewHandler(notificationService), authenticate, limit)
+
+	customerAddressService := customeraddress.NewService(customeraddress.NewGormRepository(db), log)
+	customeraddress.Register(mux, apiPrefix, customeraddress.NewHandler(customerAddressService), authenticate, limit)
 }

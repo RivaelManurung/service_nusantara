@@ -31,6 +31,7 @@ type Config struct {
 	Auth     Auth
 	Social   Social
 	OTP      OTP
+	Storage  Storage
 	Limiter  Limiter
 	Log      Log
 }
@@ -118,6 +119,23 @@ type OTP struct {
 	DefaultCountryCode string
 }
 
+// Storage configures the image backend used by the catalogue modules.
+type Storage struct {
+	CloudinaryCloudName string
+	CloudinaryAPIKey    string
+	CloudinaryAPISecret string
+	// RootFolder namespaces assets so one Cloudinary account can serve several
+	// environments without them overwriting each other.
+	RootFolder string
+	Timeout    time.Duration
+}
+
+// Configured reports whether images can actually be uploaded. When false the
+// upload endpoints refuse rather than silently storing nothing.
+func (s Storage) Configured() bool {
+	return s.CloudinaryCloudName != "" && s.CloudinaryAPIKey != "" && s.CloudinaryAPISecret != ""
+}
+
 type Limiter struct {
 	// Requests/Window is the global per-client budget.
 	Requests int
@@ -195,6 +213,13 @@ func Load() (Config, error) {
 			ResendCooldown:     r.duration("OTP_RESEND_COOLDOWN", 60*time.Second),
 			Sender:             r.str("OTP_SENDER", "log"),
 			DefaultCountryCode: r.str("PHONE_DEFAULT_COUNTRY_CODE", "62"),
+		},
+		Storage: Storage{
+			CloudinaryCloudName: r.str("CLOUDINARY_CLOUD_NAME", ""),
+			CloudinaryAPIKey:    r.str("CLOUDINARY_API_KEY", ""),
+			CloudinaryAPISecret: r.str("CLOUDINARY_API_SECRET", ""),
+			RootFolder:          r.str("CLOUDINARY_ROOT_FOLDER", "nusantara"),
+			Timeout:             r.duration("CLOUDINARY_TIMEOUT", 30*time.Second),
 		},
 		Limiter: Limiter{
 			Requests:      r.int("RATE_LIMIT_REQUESTS", 120),

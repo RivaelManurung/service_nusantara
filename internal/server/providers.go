@@ -8,6 +8,7 @@ import (
 	"service_nusantara/internal/modules/user"
 	"service_nusantara/internal/platform/oidc"
 	"service_nusantara/internal/platform/otp"
+	"service_nusantara/internal/platform/storage"
 )
 
 // socialVerifiers builds one ID token verifier per configured provider.
@@ -53,4 +54,27 @@ func phoneSignIn(cfg config.Config, rdb *redis.Client) (*otp.Store, otp.Sender, 
 	})
 
 	return store, sender, nil
+}
+
+// imageUploader builds the storage backend, falling back to one that refuses
+// uploads when no provider is configured.
+//
+// It returns the reason alongside, so startup can say why uploads are off
+// instead of leaving every image endpoint failing with an opaque 503.
+func imageUploader(cfg config.Storage) (storage.Uploader, error) {
+	if !cfg.Configured() {
+		return storage.Disabled{}, storage.ErrNotConfigured
+	}
+
+	uploader, err := storage.NewCloudinary(storage.CloudinaryConfig{
+		CloudName:  cfg.CloudinaryCloudName,
+		APIKey:     cfg.CloudinaryAPIKey,
+		APISecret:  cfg.CloudinaryAPISecret,
+		RootFolder: cfg.RootFolder,
+		Timeout:    cfg.Timeout,
+	})
+	if err != nil {
+		return storage.Disabled{}, err
+	}
+	return uploader, nil
 }
