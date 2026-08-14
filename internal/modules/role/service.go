@@ -114,6 +114,12 @@ func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
 
 // translate turns a repository error into the right HTTP status.
 func (s *Service) translate(err error, message string) error {
+	return translate(err, message)
+}
+
+// translate is the package-level form, shared with PermissionService so both
+// answer a missing role with the same 404 rather than two variants of it.
+func translate(err error, message string) error {
 	if errors.Is(err, ErrNotFound) {
 		return httpx.NotFound("role not found")
 	}

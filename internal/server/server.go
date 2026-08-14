@@ -26,6 +26,8 @@ import (
 	"service_nusantara/internal/modules/health"
 	"service_nusantara/internal/modules/notification"
 	"service_nusantara/internal/modules/product"
+	"service_nusantara/internal/modules/report"
+	"service_nusantara/internal/modules/review"
 	"service_nusantara/internal/modules/role"
 	"service_nusantara/internal/modules/shop"
 	"service_nusantara/internal/modules/typeproduct"
@@ -211,8 +213,17 @@ func registerCatalogModules(
 	roleService := role.NewService(role.NewGormRepository(db), log)
 	role.Register(mux, apiPrefix, role.NewHandler(roleService), authenticate, limit)
 
+	permissionService := role.NewPermissionService(role.NewGormRepository(db), role.NewGormPermissionRepository(db), log)
+	role.RegisterPermissions(mux, apiPrefix, role.NewPermissionHandler(permissionService), authenticate, limit)
+
 	notificationService := notification.NewService(notification.NewGormRepository(db), log)
 	notification.Register(mux, apiPrefix, notification.NewHandler(notificationService), authenticate, limit)
+
+	reportService := report.NewService(report.NewGormRepository(db), log)
+	report.Register(mux, apiPrefix, report.NewHandler(reportService), authenticate, limit)
+
+	reviewService := review.NewService(review.NewGormRepository(db), log)
+	review.Register(mux, apiPrefix, review.NewHandler(reviewService), authenticate, limit)
 
 	customerAddressService := customeraddress.NewService(customeraddress.NewGormRepository(db), log)
 	customeraddress.Register(mux, apiPrefix, customeraddress.NewHandler(customerAddressService), authenticate, limit)

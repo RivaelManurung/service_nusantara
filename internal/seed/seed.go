@@ -71,6 +71,7 @@ type stage struct {
 // stages run in this order; later ones depend on earlier ones.
 var stages = []stage{
 	{"roles", (*Seeder).seedRoles},
+	{"permissions", (*Seeder).seedPermissions},
 	{"users", (*Seeder).seedUsers},
 	{"identities", (*Seeder).seedIdentities},
 	{"images", (*Seeder).seedImages},

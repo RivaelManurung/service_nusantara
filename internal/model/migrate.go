@@ -13,7 +13,7 @@ import (
 // forgotten in a config package on the other side of the tree.
 func All() []any {
 	return []any{
-		&Role{}, &User{}, &UserIdentity{},
+		&Role{}, &Permission{}, &RolePermission{}, &User{}, &UserIdentity{},
 		&Image{},
 		&Banner{}, &TypeProduct{},
 		&UserPoint{}, &UserPointHistories{},
@@ -25,6 +25,7 @@ func All() []any {
 		&Cart{}, &CartItem{},
 		&Favorite{}, &FavoriteItem{},
 		&Order{}, &OrderItem{}, &OrderEvent{}, &OrderReward{}, &OrderVoucher{},
+		&Review{},
 		&Notification{},
 	}
 }
