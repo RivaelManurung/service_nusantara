@@ -14,13 +14,19 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api
+# Both commands ship in the image. The seeder has to run *inside* Railway --
+# Postgres is only reachable at postgres.railway.internal -- so leaving it out
+# meant there was no way to create the schema's first role, and therefore no
+# way for anyone to log in.
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/api  ./cmd/api \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/seed ./cmd/seed
 
 # --- runtime -----------------------------------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /app
-COPY --from=build /out/api /app/api
+COPY --from=build /out/api  /app/api
+COPY --from=build /out/seed /app/seed
 
 # Run unprivileged: a compromised process should not be root in the container.
 USER nonroot:nonroot
