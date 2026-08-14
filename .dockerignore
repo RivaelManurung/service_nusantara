@@ -1,0 +1,28 @@
+# Secrets must never reach the build context. The Dockerfile does `COPY . .`,
+# so without this an .env sitting next to the source is baked into an image
+# layer -- and readable by anyone who can pull it.
+.env
+.env.*
+!.env.example
+
+# Version control and local tooling.
+.git
+.gitignore
+.github
+
+# Build output and test artefacts.
+bin/
+tmp/
+*.exe
+*.test
+*.out
+coverage.out
+
+# Documentation: not needed to compile, and it only invalidates the cache.
+*.md
+Makefile
+
+# Editors.
+.idea/
+.vscode/
+.DS_Store
