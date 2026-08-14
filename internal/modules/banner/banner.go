@@ -37,6 +37,10 @@ type Banner struct {
 	Description string    `json:"description"`
 	Status      int       `json:"status"`
 
+	// PhotoPublicID is the storage handle, never part of the client contract.
+	// It exists so a replaced or deleted image can actually be removed.
+	PhotoPublicID string `json:"-"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -70,7 +74,7 @@ type Repository interface {
 	FindActiveByID(ctx context.Context, id uuid.UUID) (Banner, error)
 	ExistsByName(ctx context.Context, name string, excludeID uuid.UUID) (bool, error)
 	Create(ctx context.Context, row Banner, createdBy uuid.UUID) (Banner, error)
-	Update(ctx context.Context, id uuid.UUID, name, description, photo string) (Banner, error)
+	Update(ctx context.Context, id uuid.UUID, name, description, photo, photoPublicID string) (Banner, error)
 	UpdateStatus(ctx context.Context, id uuid.UUID, status int) error
 	Delete(ctx context.Context, id uuid.UUID) error
 }

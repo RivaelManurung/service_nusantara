@@ -117,14 +117,15 @@ func (r *GormRepository) Create(ctx context.Context, row Cashier, passwordHash s
 	email := row.Email
 
 	record := model.User{
-		ID:       row.ID,
-		Name:     row.Name,
-		Username: &username,
-		Email:    &email,
-		Password: &passwordHash,
-		Photo:    row.Photo,
-		RoleID:   roleID,
-		Status:   row.Status,
+		ID:            row.ID,
+		Name:          row.Name,
+		Username:      &username,
+		Email:         &email,
+		Password:      &passwordHash,
+		Photo:         row.Photo,
+		PhotoPublicID: row.PhotoPublicID,
+		RoleID:        roleID,
+		Status:        row.Status,
 	}
 	if err := r.db.WithContext(ctx).Create(&record).Error; err != nil {
 		return Cashier{}, fmt.Errorf("create cashier: %w", err)
@@ -134,7 +135,7 @@ func (r *GormRepository) Create(ctx context.Context, row Cashier, passwordHash s
 	return r.FindByID(ctx, record.ID)
 }
 
-func (r *GormRepository) Update(ctx context.Context, id uuid.UUID, name, username, photo string, status *int) (Cashier, error) {
+func (r *GormRepository) Update(ctx context.Context, id uuid.UUID, name, username, photo, photoPublicID string, status *int) (Cashier, error) {
 	updates := map[string]any{"updated_at": time.Now().UTC()}
 	if name != "" {
 		updates["name"] = name
@@ -143,8 +144,11 @@ func (r *GormRepository) Update(ctx context.Context, id uuid.UUID, name, usernam
 		updates["username"] = username
 	}
 	// An empty photo means "keep the existing one", so it must not be written.
+	// The public id moves with the URL: writing one without the other would
+	// leave a handle pointing at an asset the record no longer shows.
 	if photo != "" {
 		updates["photo"] = photo
+		updates["photo_public_id"] = photoPublicID
 	}
 	if status != nil {
 		updates["status"] = *status
@@ -181,15 +185,16 @@ func (r *GormRepository) Delete(ctx context.Context, id uuid.UUID) error {
 
 func toCashier(row model.User) Cashier {
 	return Cashier{
-		ID:        row.ID,
-		Name:      row.Name,
-		Username:  deref(row.Username),
-		Email:     deref(row.Email),
-		Photo:     row.Photo,
-		Status:    row.Status,
-		Role:      row.Role.Name,
-		CreatedAt: row.CreatedAt,
-		UpdatedAt: row.UpdatedAt,
+		ID:            row.ID,
+		Name:          row.Name,
+		Username:      deref(row.Username),
+		Email:         deref(row.Email),
+		Photo:         row.Photo,
+		PhotoPublicID: row.PhotoPublicID,
+		Status:        row.Status,
+		Role:          row.Role.Name,
+		CreatedAt:     row.CreatedAt,
+		UpdatedAt:     row.UpdatedAt,
 	}
 }
 

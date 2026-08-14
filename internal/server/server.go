@@ -185,22 +185,24 @@ func registerCatalogModules(
 	log *slog.Logger,
 	authenticate, limit middleware.Middleware,
 ) {
-	typeProductService := typeproduct.NewService(typeproduct.NewGormRepository(db), images, log)
+	reaper := storage.NewReaper(images, log)
+
+	typeProductService := typeproduct.NewService(typeproduct.NewGormRepository(db), images, reaper, log)
 	typeproduct.Register(mux, apiPrefix, typeproduct.NewHandler(typeProductService), authenticate, limit)
 
-	productService := product.NewService(product.NewGormRepository(db), images, log)
+	productService := product.NewService(product.NewGormRepository(db), images, reaper, log)
 	product.Register(mux, apiPrefix, product.NewHandler(productService), authenticate, limit)
 
-	shopService := shop.NewService(shop.NewGormRepository(db), images, log)
+	shopService := shop.NewService(shop.NewGormRepository(db), images, reaper, log)
 	shop.Register(mux, apiPrefix, shop.NewHandler(shopService), authenticate, limit)
 
-	bannerService := banner.NewService(banner.NewGormRepository(db), images, log)
+	bannerService := banner.NewService(banner.NewGormRepository(db), images, reaper, log)
 	banner.Register(mux, apiPrefix, banner.NewHandler(bannerService), authenticate, limit)
 
-	cashierService := cashier.NewService(cashier.NewGormRepository(db), images, hasher, log)
+	cashierService := cashier.NewService(cashier.NewGormRepository(db), images, reaper, hasher, log)
 	cashier.Register(mux, apiPrefix, cashier.NewHandler(cashierService), authenticate, limit)
 
-	eventService := event.NewService(event.NewGormRepository(db), images, log)
+	eventService := event.NewService(event.NewGormRepository(db), images, reaper, log)
 	event.Register(mux, apiPrefix, event.NewHandler(eventService), authenticate, limit)
 
 	voucherService := voucher.NewService(voucher.NewGormRepository(db), log)

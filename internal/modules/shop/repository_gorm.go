@@ -78,13 +78,14 @@ func (r *GormRepository) Create(ctx context.Context, record Record, assign Assig
 
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		row := model.Shop{
-			ID:          id,
-			Name:        record.Name,
-			Cover:       record.Cover,
-			Description: record.Description,
-			FullAddress: record.FullAddress,
-			Status:      record.Status,
-			CreatedBy:   record.CreatedBy,
+			ID:            id,
+			Name:          record.Name,
+			Cover:         record.Cover,
+			CoverPublicID: record.CoverPublicID,
+			Description:   record.Description,
+			FullAddress:   record.FullAddress,
+			Status:        record.Status,
+			CreatedBy:     record.CreatedBy,
 		}
 		if record.Lat != nil {
 			row.Lat = *record.Lat
@@ -126,8 +127,11 @@ func (r *GormRepository) Update(ctx context.Context, id uuid.UUID, record Record
 		if record.Lng != nil {
 			updates["lng"] = *record.Lng
 		}
+		// The public id moves with the URL: writing one without the other would
+		// leave a handle pointing at an asset the record no longer shows.
 		if record.Cover != "" {
 			updates["cover"] = record.Cover
+			updates["cover_public_id"] = record.CoverPublicID
 		}
 
 		result := tx.Model(&model.Shop{}).Where("id = ?", id).Updates(updates)
@@ -320,7 +324,7 @@ func (r *GormRepository) AssignedShop(ctx context.Context, staffID, shopID uuid.
 		Lat:         row.Lat,
 		Lng:         row.Lng,
 		Status:      row.Status,
-		ShopImages:  orEmpty(gallery[shopID]),
+		ShopImages:  galleryURLs(gallery[shopID]),
 		CreatedAt:   row.CreatedAt,
 		UpdatedAt:   row.UpdatedAt,
 	}, nil
@@ -413,22 +417,30 @@ func (r *GormRepository) hydrate(ctx context.Context, rows []model.Shop) ([]Shop
 			CreatedBy:    row.Creator.Name,
 			CreatedAt:    row.CreatedAt,
 			UpdatedAt:    row.UpdatedAt,
-			ShopImages:   orEmpty(gallery[row.ID]),
+			ShopImages:   galleryURLs(gallery[row.ID]),
 			ShopProducts: orEmptyProducts(products[row.ID]),
 			ShopCashiers: orEmptyCashiers(cashiers[row.ID]),
+
+			CoverPublicID:    row.CoverPublicID,
+			GalleryPublicIDs: publicIDs(gallery[row.ID]),
 		})
 	}
 	return items, nil
 }
 
-func (r *GormRepository) galleryByShop(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]string, error) {
+// galleryByShop reads the gallery of every listed shop. The public id is read
+// alongside the URL so a caller that replaces or deletes the gallery knows what
+// to remove from the storage provider -- once the join rows are gone, nothing
+// else records the handles.
+func (r *GormRepository) galleryByShop(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]GalleryImage, error) {
 	var rows []struct {
 		ShopID    uuid.UUID
 		ImagePath string
+		PublicID  string
 	}
 	err := r.db.WithContext(ctx).
 		Table("shop_images").
-		Select("shop_images.shop_id", "images.image_path").
+		Select("shop_images.shop_id", "images.image_path", "images.public_id").
 		Joins("JOIN images ON images.id = shop_images.image_id").
 		Where("shop_images.shop_id IN ?", ids).
 		Where("shop_images.deleted_at IS NULL").
@@ -438,11 +450,22 @@ func (r *GormRepository) galleryByShop(ctx context.Context, ids []uuid.UUID) (ma
 		return nil, fmt.Errorf("load shop gallery: %w", err)
 	}
 
-	gallery := map[uuid.UUID][]string{}
+	gallery := map[uuid.UUID][]GalleryImage{}
 	for _, row := range rows {
-		gallery[row.ShopID] = append(gallery[row.ShopID], row.ImagePath)
+		gallery[row.ShopID] = append(gallery[row.ShopID],
+			GalleryImage{URL: row.ImagePath, PublicID: row.PublicID})
 	}
 	return gallery, nil
+}
+
+// galleryURLs is the client-facing half of a gallery, kept non-nil so an empty
+// gallery renders as [] rather than null.
+func galleryURLs(images []GalleryImage) []string {
+	urls := make([]string, 0, len(images))
+	for _, image := range images {
+		urls = append(urls, image.URL)
+	}
+	return urls
 }
 
 func (r *GormRepository) productsByShop(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]ShopProduct, error) {
@@ -521,8 +544,8 @@ func writeAssignments(tx *gorm.DB, shopID uuid.UUID, altText string, assign Assi
 			return fmt.Errorf("clear shop gallery: %w", err)
 		}
 	}
-	for _, url := range assign.Gallery {
-		image := model.Image{ID: uuid.New(), ImagePath: url}
+	for _, picture := range assign.Gallery {
+		image := model.Image{ID: uuid.New(), ImagePath: picture.URL, PublicID: picture.PublicID}
 		if err := tx.Omit(clause.Associations).Create(&image).Error; err != nil {
 			return fmt.Errorf("create gallery image: %w", err)
 		}
@@ -601,13 +624,6 @@ func deref(value *string) string {
 // The orEmpty helpers keep an absent relation rendering as [] rather than null,
 // which is what the web client's `?? []` fallbacks assume but the mobile
 // clients do not tolerate.
-func orEmpty(values []string) []string {
-	if values == nil {
-		return []string{}
-	}
-	return values
-}
-
 func orEmptyProducts(values []ShopProduct) []ShopProduct {
 	if values == nil {
 		return []ShopProduct{}

@@ -2,7 +2,6 @@ package seed
 
 import (
 	"context"
-	"fmt"
 
 	"service_nusantara/internal/model"
 )
@@ -19,15 +18,16 @@ func (s *Seeder) seedShops(ctx context.Context, _ Options) error {
 		shopID := id("shop", shop.Key)
 
 		shops = append(shops, model.Shop{
-			ID:          shopID,
-			Name:        shop.Name,
-			Cover:       fmt.Sprintf("https://cdn.nusantara.test/shops/%s-cover.jpg", shop.Key),
-			Description: shop.Description,
-			FullAddress: shop.Address,
-			Lat:         shop.Lat,
-			Lng:         shop.Lng,
-			Status:      1,
-			CreatedBy:   adminID,
+			ID:            shopID,
+			Name:          shop.Name,
+			Cover:         assetURL(FolderShops, shop.Key+"-cover"),
+			CoverPublicID: assetPublicID(FolderShops, shop.Key+"-cover"),
+			Description:   shop.Description,
+			FullAddress:   shop.Address,
+			Lat:           shop.Lat,
+			Lng:           shop.Lng,
+			Status:        1,
+			CreatedBy:     adminID,
 		})
 
 		shopImages = append(shopImages, model.ShopImage{

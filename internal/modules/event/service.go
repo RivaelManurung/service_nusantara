@@ -27,15 +27,22 @@ type uploader interface {
 	Upload(ctx context.Context, file *multipart.FileHeader, folder string) (storage.Uploaded, error)
 }
 
+// reaper removes assets a record no longer points at. It is an interface so a
+// test can assert that a replaced cover is actually cleaned up.
+type reaper interface {
+	Discard(ctx context.Context, publicID string)
+}
+
 // Service holds the business rules.
 type Service struct {
 	repo   Repository
 	images uploader
+	reaper reaper
 	log    *slog.Logger
 }
 
-func NewService(repo Repository, images uploader, log *slog.Logger) *Service {
-	return &Service{repo: repo, images: images, log: log}
+func NewService(repo Repository, images uploader, reaper reaper, log *slog.Logger) *Service {
+	return &Service{repo: repo, images: images, reaper: reaper, log: log}
 }
 
 // List returns one page of events.
@@ -83,15 +90,18 @@ func (s *Service) Create(ctx context.Context, input Input) (Event, error) {
 	}
 
 	created, err := s.repo.Create(ctx, Event{
-		ID:        uuid.New(),
-		Name:      input.Name,
-		TypeEvent: input.TypeEvent,
-		StartDate: input.StartDate,
-		EndDate:   input.EndDate,
-		Cover:     cover,
-		Status:    normalizeStatus(input.Status),
+		ID:            uuid.New(),
+		Name:          input.Name,
+		TypeEvent:     input.TypeEvent,
+		StartDate:     input.StartDate,
+		EndDate:       input.EndDate,
+		Cover:         cover.URL,
+		CoverPublicID: cover.PublicID,
+		Status:        normalizeStatus(input.Status),
 	}, children, input.CreatedBy)
 	if err != nil {
+		// The upload already happened, so a failed insert would strand it.
+		s.reaper.Discard(ctx, cover.PublicID)
 		return Event{}, httpx.Internal("failed to create event").WithCause(err)
 	}
 	return created, nil
@@ -100,7 +110,8 @@ func (s *Service) Create(ctx context.Context, input Input) (Event, error) {
 // Update edits an event and replaces its child rows. Sending no file keeps the
 // existing cover; the status is left alone, since /edit-status owns it.
 func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (Event, error) {
-	if _, err := s.repo.FindByID(ctx, id); err != nil {
+	existing, err := s.repo.FindByID(ctx, id)
+	if err != nil {
 		return Event{}, s.translate(err, "failed to load event")
 	}
 
@@ -121,7 +132,7 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (Event,
 		return Event{}, err
 	}
 
-	cover := ""
+	var cover storage.Uploaded
 	if input.Cover != nil {
 		if cover, err = s.uploadCover(ctx, input.Cover); err != nil {
 			return Event{}, err
@@ -129,14 +140,22 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (Event,
 	}
 
 	updated, err := s.repo.Update(ctx, id, Event{
-		Name:      input.Name,
-		TypeEvent: input.TypeEvent,
-		StartDate: input.StartDate,
-		EndDate:   input.EndDate,
-		Cover:     cover,
+		Name:          input.Name,
+		TypeEvent:     input.TypeEvent,
+		StartDate:     input.StartDate,
+		EndDate:       input.EndDate,
+		Cover:         cover.URL,
+		CoverPublicID: cover.PublicID,
 	}, children)
 	if err != nil {
+		// The row still points at the old cover, so the new upload is stranded.
+		s.reaper.Discard(ctx, cover.PublicID)
 		return Event{}, s.translate(err, "failed to update event")
+	}
+
+	// Only once the row commits to the new cover is the old one safe to drop.
+	if cover.PublicID != "" {
+		s.reaper.Discard(ctx, existing.CoverPublicID)
 	}
 	return updated, nil
 }
@@ -150,10 +169,23 @@ func (s *Service) SetStatus(ctx context.Context, id uuid.UUID, status int) error
 }
 
 // Delete removes an event and its child rows.
+//
+// The row is read first because deleting it is what makes its cover
+// unreachable: nothing else in the system records the handle, so the only
+// moment the asset can still be found is before the row goes.
 func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
+	existing, err := s.repo.FindByID(ctx, id)
+	if err != nil {
+		return s.translate(err, "failed to load event")
+	}
+
 	if err := s.repo.Delete(ctx, id); err != nil {
 		return s.translate(err, "failed to delete event")
 	}
+
+	// The delete is a soft delete, but no endpoint restores an event, so the
+	// cover is unreachable from here on and keeping it only leaks storage.
+	s.reaper.Discard(ctx, existing.CoverPublicID)
 	return nil
 }
 
@@ -331,21 +363,21 @@ func (s *Service) resolveChildren(ctx context.Context, input Input) (Children, e
 	return children, nil
 }
 
-func (s *Service) uploadCover(ctx context.Context, file *multipart.FileHeader) (string, error) {
+func (s *Service) uploadCover(ctx context.Context, file *multipart.FileHeader) (storage.Uploaded, error) {
 	if file == nil {
-		return "", httpx.Validation("request validation failed").
+		return storage.Uploaded{}, httpx.Validation("request validation failed").
 			WithDetails([]httpx.FieldError{{Field: "cover", Message: "is required"}})
 	}
 
 	uploaded, err := s.images.Upload(ctx, file, coverFolder)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotConfigured) {
-			return "", httpx.Unavailable("image uploads are not configured on this server").WithCause(err)
+			return storage.Uploaded{}, httpx.Unavailable("image uploads are not configured on this server").WithCause(err)
 		}
 		// A rejected file is the caller's problem; anything else is ours.
-		return "", httpx.BadRequest(err.Error()).WithCause(err)
+		return storage.Uploaded{}, httpx.BadRequest(err.Error()).WithCause(err)
 	}
-	return uploaded.URL, nil
+	return uploaded, nil
 }
 
 // translate turns a repository error into the right HTTP status.

@@ -34,6 +34,10 @@ type TypeProduct struct {
 	Image  string    `json:"image"`
 	Status int       `json:"status"`
 
+	// ImagePublicID is the storage handle, never part of the client contract.
+	// It exists so a replaced or deleted image can actually be removed.
+	ImagePublicID string `json:"-"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -62,7 +66,7 @@ type Repository interface {
 	FindByID(ctx context.Context, id uuid.UUID) (TypeProduct, error)
 	ExistsByName(ctx context.Context, name string, excludeID uuid.UUID) (bool, error)
 	Create(ctx context.Context, row TypeProduct, createdBy uuid.UUID) (TypeProduct, error)
-	Update(ctx context.Context, id uuid.UUID, name, image string) (TypeProduct, error)
+	Update(ctx context.Context, id uuid.UUID, name, image, imagePublicID string) (TypeProduct, error)
 	UpdateStatus(ctx context.Context, id uuid.UUID, status int) error
 	Delete(ctx context.Context, id uuid.UUID) error
 	// InUse reports whether any product still references this category, so the

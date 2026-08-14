@@ -29,6 +29,11 @@ type User struct {
 	Gender      string     `gorm:"type:varchar(100)"`
 	DateOfBirth *time.Time `gorm:"type:date"`
 	Photo       string     `gorm:"type:varchar(255)"`
+	// PublicID is the storage provider's own handle. Without it a replaced or
+	// deleted record leaks its asset: the URL alone cannot address the file
+	// for deletion, and re-deriving an id by parsing the URL is exactly the
+	// fragile string surgery this rewrite avoids.
+	PhotoPublicID string `gorm:"type:varchar(255)" json:"-"`
 
 	RoleID uuid.UUID `gorm:"type:uuid;index"`
 	Role   Role      `gorm:"foreignKey:RoleID"`

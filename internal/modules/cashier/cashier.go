@@ -52,6 +52,10 @@ type Cashier struct {
 	Status   int       `json:"status"`
 	Role     string    `json:"role"`
 
+	// PhotoPublicID is the storage handle, never part of the client contract.
+	// It exists so a replaced or deleted photo can actually be removed.
+	PhotoPublicID string `json:"-"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -102,6 +106,6 @@ type Repository interface {
 	Create(ctx context.Context, row Cashier, passwordHash string, roleID uuid.UUID) (Cashier, error)
 	// Update writes only the non-empty values; an empty name, username or photo
 	// and a nil status all mean "keep what is stored".
-	Update(ctx context.Context, id uuid.UUID, name, username, photo string, status *int) (Cashier, error)
+	Update(ctx context.Context, id uuid.UUID, name, username, photo, photoPublicID string, status *int) (Cashier, error)
 	Delete(ctx context.Context, id uuid.UUID) error
 }

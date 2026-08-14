@@ -111,20 +111,19 @@ const (
 
 // seedTypeProduct is a product category.
 type seedTypeProduct struct {
-	Key   string
-	Name  string
-	Image string
+	Key  string
+	Name string
 }
 
 var seedTypeProducts = []seedTypeProduct{
-	{"keripik", "Keripik & Kerupuk", "https://cdn.nusantara.test/types/keripik.jpg"},
-	{"dodol", "Dodol & Manisan", "https://cdn.nusantara.test/types/dodol.jpg"},
-	{"kue", "Kue Kering", "https://cdn.nusantara.test/types/kue-kering.jpg"},
-	{"bakpia", "Bakpia & Pia", "https://cdn.nusantara.test/types/bakpia.jpg"},
-	{"kopi", "Kopi & Teh", "https://cdn.nusantara.test/types/kopi.jpg"},
-	{"sambal", "Sambal & Bumbu", "https://cdn.nusantara.test/types/sambal.jpg"},
-	{"kain", "Batik & Kain", "https://cdn.nusantara.test/types/batik.jpg"},
-	{"kerajinan", "Kerajinan Tangan", "https://cdn.nusantara.test/types/kerajinan.jpg"},
+	{"keripik", "Keripik & Kerupuk"},
+	{"dodol", "Dodol & Manisan"},
+	{"kue", "Kue Kering"},
+	{"bakpia", "Bakpia & Pia"},
+	{"kopi", "Kopi & Teh"},
+	{"sambal", "Sambal & Bumbu"},
+	{"kain", "Batik & Kain"},
+	{"kerajinan", "Kerajinan Tangan"},
 }
 
 // seedProduct is one catalogue item.
@@ -218,14 +217,13 @@ type seedBanner struct {
 	Key         string
 	Name        string
 	Description string
-	Photo       string
 }
 
 var seedBanners = []seedBanner{
-	{"lebaran", "Hampers Lebaran 2026", "Paket hampers kue kering dan bakpia, gratis kartu ucapan.", "https://cdn.nusantara.test/banners/lebaran.jpg"},
-	{"gratis-ongkir", "Gratis Ongkir Se-Jawa", "Minimal belanja Rp150.000, berlaku untuk seluruh outlet.", "https://cdn.nusantara.test/banners/ongkir.jpg"},
-	{"kopi-nusantara", "Pekan Kopi Nusantara", "Diskon 20 persen untuk seluruh kopi single origin.", "https://cdn.nusantara.test/banners/kopi.jpg"},
-	{"batik-day", "Hari Batik Nasional", "Koleksi batik tulis dan cap pilihan pengrajin.", "https://cdn.nusantara.test/banners/batik.jpg"},
+	{"lebaran", "Hampers Lebaran 2026", "Paket hampers kue kering dan bakpia, gratis kartu ucapan."},
+	{"gratis-ongkir", "Gratis Ongkir Se-Jawa", "Minimal belanja Rp150.000, berlaku untuk seluruh outlet."},
+	{"kopi-nusantara", "Pekan Kopi Nusantara", "Diskon 20 persen untuk seluruh kopi single origin."},
+	{"batik-day", "Hari Batik Nasional", "Koleksi batik tulis dan cap pilihan pengrajin."},
 }
 
 // seedVoucher is a discount coupon.

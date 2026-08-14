@@ -109,7 +109,7 @@ func (r *GormRepository) Create(ctx context.Context, write Write) (Product, erro
 	id := uuid.New()
 
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		cover := model.Image{ID: uuid.New(), ImagePath: write.CoverURL}
+		cover := model.Image{ID: uuid.New(), ImagePath: write.Cover.URL, PublicID: write.Cover.PublicID}
 		if err := tx.Create(&cover).Error; err != nil {
 			return fmt.Errorf("create cover image: %w", err)
 		}
@@ -132,7 +132,7 @@ func (r *GormRepository) Create(ctx context.Context, write Write) (Product, erro
 			return fmt.Errorf("create product: %w", err)
 		}
 
-		return linkGallery(tx, id, write.Name, write.GalleryURLs)
+		return linkGallery(tx, id, write.Name, write.Gallery)
 	})
 	if err != nil {
 		return Product{}, err
@@ -157,9 +157,11 @@ func (r *GormRepository) Update(ctx context.Context, id uuid.UUID, write Write) 
 		}
 
 		// An empty URL means "keep the existing cover", so no image row is
-		// written and the column is left alone.
-		if write.CoverURL != "" {
-			cover := model.Image{ID: uuid.New(), ImagePath: write.CoverURL}
+		// written and the column is left alone. The public id moves with the
+		// URL: storing one without the other would leave a handle pointing at
+		// an asset the record no longer shows.
+		if write.Cover.URL != "" {
+			cover := model.Image{ID: uuid.New(), ImagePath: write.Cover.URL, PublicID: write.Cover.PublicID}
 			if err := tx.Create(&cover).Error; err != nil {
 				return fmt.Errorf("create cover image: %w", err)
 			}
@@ -180,7 +182,7 @@ func (r *GormRepository) Update(ctx context.Context, id uuid.UUID, write Write) 
 			}
 		}
 
-		return linkGallery(tx, id, write.Name, write.GalleryURLs)
+		return linkGallery(tx, id, write.Name, write.Gallery)
 	})
 	if err != nil {
 		return Product{}, err
@@ -223,15 +225,17 @@ func (r *GormRepository) Delete(ctx context.Context, id uuid.UUID) error {
 	})
 }
 
-// linkGallery stores one image row per URL and joins it to the product.
-func linkGallery(tx *gorm.DB, productID uuid.UUID, altText string, urls []string) error {
-	if len(urls) == 0 {
+// linkGallery stores one image row per upload and joins it to the product. The
+// provider's public id is stored alongside the URL, so replacing or deleting
+// the gallery later can actually remove the files.
+func linkGallery(tx *gorm.DB, productID uuid.UUID, altText string, uploads []UploadedImage) error {
+	if len(uploads) == 0 {
 		return nil
 	}
 
-	images := make([]model.Image, 0, len(urls))
-	for _, url := range urls {
-		images = append(images, model.Image{ID: uuid.New(), ImagePath: url})
+	images := make([]model.Image, 0, len(uploads))
+	for _, upload := range uploads {
+		images = append(images, model.Image{ID: uuid.New(), ImagePath: upload.URL, PublicID: upload.PublicID})
 	}
 	if err := tx.Create(&images).Error; err != nil {
 		return fmt.Errorf("create gallery images: %w", err)
@@ -276,7 +280,7 @@ func toProduct(row model.Product) Product {
 	}
 
 	if row.ImageID != uuid.Nil {
-		item.Image = &Image{ImagePath: row.Image.ImagePath}
+		item.Image = &Image{ImagePath: row.Image.ImagePath, PublicID: row.Image.PublicID}
 	}
 	if row.TypeProductID != uuid.Nil {
 		item.TypeProduct = &TypeProductRef{ID: row.TypeProduct.ID, Name: row.TypeProduct.Name}
@@ -287,7 +291,7 @@ func toProduct(row model.Product) Product {
 
 	for _, link := range row.ProductImages {
 		item.ProductImages = append(item.ProductImages, GalleryImage{
-			Image: &Image{ImagePath: link.Image.ImagePath},
+			Image: &Image{ImagePath: link.Image.ImagePath, PublicID: link.Image.PublicID},
 		})
 	}
 	return item

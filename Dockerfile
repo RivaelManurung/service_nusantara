@@ -18,15 +18,19 @@ COPY . .
 # Postgres is only reachable at postgres.railway.internal -- so leaving it out
 # meant there was no way to create the schema's first role, and therefore no
 # way for anyone to log in.
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/api  ./cmd/api \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/seed ./cmd/seed
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/api             ./cmd/api \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/migrate         ./cmd/migrate \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/seed            ./cmd/seed \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/backfill-images ./cmd/backfill-images
 
 # --- runtime -----------------------------------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /app
-COPY --from=build /out/api  /app/api
-COPY --from=build /out/seed /app/seed
+COPY --from=build /out/api             /app/api
+COPY --from=build /out/migrate         /app/migrate
+COPY --from=build /out/seed            /app/seed
+COPY --from=build /out/backfill-images /app/backfill-images
 
 # Run unprivileged: a compromised process should not be root in the container.
 USER nonroot:nonroot

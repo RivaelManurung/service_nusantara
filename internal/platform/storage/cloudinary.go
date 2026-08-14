@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cloudinary/cloudinary-go/v2"
+	"github.com/cloudinary/cloudinary-go/v2/api/admin"
 	"github.com/cloudinary/cloudinary-go/v2/api/uploader"
 )
 
@@ -106,3 +107,52 @@ func (c *Cloudinary) folderPath(folder string) string {
 }
 
 func boolPtr(v bool) *bool { return &v }
+
+// Exists reports whether an asset with this public id is present.
+//
+// The backfill command uses it to prove a public id derived from a stored URL
+// is real before writing it. Deriving without verifying would replace one
+// unusable value (empty) with a worse one (a plausible id pointing at nothing),
+// and a later delete would silently do nothing.
+func (c *Cloudinary) Exists(ctx context.Context, publicID string) (bool, error) {
+	if publicID == "" {
+		return false, nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	result, err := c.client.Admin.Asset(ctx, admin.AssetParams{PublicID: publicID})
+	if err != nil {
+		return false, fmt.Errorf("look up %s: %w", publicID, err)
+	}
+	// The API answers 404 in the body rather than as a transport error.
+	if result.Error.Message != "" {
+		return false, nil
+	}
+	return result.PublicID != "", nil
+}
+
+// UploadFile stores a file from disk at an exact public id, replacing whatever
+// was there.
+//
+// The seed assets need a deterministic handle so the fixture can compute their
+// URLs, which the multipart Upload path deliberately does not allow: there a
+// caller-chosen id would let one upload overwrite another's asset.
+func (c *Cloudinary) UploadFile(ctx context.Context, path, publicID string) error {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	overwrite := true
+	_, err := c.client.Upload.Upload(ctx, path, uploader.UploadParams{
+		PublicID:     publicID,
+		Overwrite:    &overwrite,
+		ResourceType: "image",
+		// The id already carries the folder, so Cloudinary must not add one.
+		UseFilename: boolPtr(false),
+	})
+	if err != nil {
+		return fmt.Errorf("upload %s: %w", path, err)
+	}
+	return nil
+}

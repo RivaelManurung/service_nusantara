@@ -36,16 +36,25 @@ type hasher interface {
 	Hash(password string) (string, error)
 }
 
+// reaper removes assets a record no longer points at. It is an interface so a
+// test can assert that a replaced photo is actually cleaned up.
+type reaper interface {
+	Discard(ctx context.Context, publicID string)
+}
+
 // Service holds the business rules.
 type Service struct {
 	repo      Repository
 	images    uploader
+	reaper    reaper
 	passwords hasher
 	log       *slog.Logger
 }
 
-func NewService(repo Repository, images uploader, passwords hasher, log *slog.Logger) *Service {
-	return &Service{repo: repo, images: images, passwords: passwords, log: log}
+// NewService takes the reaper directly after the uploader it complements, which
+// is where typeproduct and banner also put it.
+func NewService(repo Repository, images uploader, reaper reaper, passwords hasher, log *slog.Logger) *Service {
+	return &Service{repo: repo, images: images, reaper: reaper, passwords: passwords, log: log}
 }
 
 // List returns one page of cashier accounts.
@@ -95,20 +104,23 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Cashier, error
 		return Cashier{}, httpx.Internal("failed to secure the password").WithCause(err)
 	}
 
-	photo, err := s.uploadImage(ctx, input.Image)
+	uploaded, err := s.uploadImage(ctx, input.Image)
 	if err != nil {
 		return Cashier{}, err
 	}
 
 	created, err := s.repo.Create(ctx, Cashier{
-		ID:       uuid.New(),
-		Name:     input.Name,
-		Username: input.Username,
-		Email:    strings.ToLower(input.Email),
-		Photo:    photo,
-		Status:   normalizeStatus(input.Status),
+		ID:            uuid.New(),
+		Name:          input.Name,
+		Username:      input.Username,
+		Email:         strings.ToLower(input.Email),
+		Photo:         uploaded.URL,
+		PhotoPublicID: uploaded.PublicID,
+		Status:        normalizeStatus(input.Status),
 	}, passwordHash, roleID)
 	if err != nil {
+		// The upload already happened, so a failed insert would strand it.
+		s.reaper.Discard(ctx, uploaded.PublicID)
 		return Cashier{}, httpx.Internal("failed to create cashier").WithCause(err)
 	}
 	return created, nil
@@ -120,7 +132,8 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Cashier, error
 // route for cashiers, so the web client posts `status` to this same endpoint.
 // Every field is therefore optional, and an absent one is left untouched.
 func (s *Service) Update(ctx context.Context, id uuid.UUID, input UpdateInput) (Cashier, error) {
-	if _, err := s.repo.FindByID(ctx, id); err != nil {
+	existing, err := s.repo.FindByID(ctx, id)
+	if err != nil {
 		return Cashier{}, s.translate(err, "failed to load cashier")
 	}
 
@@ -147,27 +160,51 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, input UpdateInput) (
 		status = &normalized
 	}
 
-	photo := ""
+	var uploaded storage.Uploaded
 	if input.Image != nil {
-		uploaded, err := s.uploadImage(ctx, input.Image)
-		if err != nil {
+		if uploaded, err = s.uploadImage(ctx, input.Image); err != nil {
 			return Cashier{}, err
 		}
-		photo = uploaded
 	}
 
-	updated, err := s.repo.Update(ctx, id, name, username, photo, status)
+	updated, err := s.repo.Update(ctx, id, name, username, uploaded.URL, uploaded.PublicID, status)
 	if err != nil {
+		// The row still points at the old photo, so the new upload is stranded.
+		s.reaper.Discard(ctx, uploaded.PublicID)
 		return Cashier{}, s.translate(err, "failed to update cashier")
+	}
+
+	// Only once the row commits to the new photo is the old one safe to drop.
+	if uploaded.PublicID != "" {
+		s.reaper.Discard(ctx, existing.PhotoPublicID)
 	}
 	return updated, nil
 }
 
 // Delete removes a cashier account.
+//
+// The row is read before it is removed, because afterwards there is nothing
+// left to learn the storage handle from.
+//
+// Deleting a cashier soft-deletes its `users` row, so the record technically
+// survives with a photo URL this call is about to invalidate. The asset is
+// still discarded: nothing in this codebase ever un-deletes a user (no
+// Unscoped read, no restore endpoint), so a retained image would be an
+// unreachable file kept forever on the off chance of a manual SQL revival --
+// which is precisely the leak this change exists to stop. A restore would have
+// to re-upload the photo, exactly as it would have to re-check the now-freed
+// username and email uniqueness.
 func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
+	existing, err := s.repo.FindByID(ctx, id)
+	if err != nil {
+		return s.translate(err, "failed to load cashier")
+	}
+
 	if err := s.repo.Delete(ctx, id); err != nil {
 		return s.translate(err, "failed to delete cashier")
 	}
+
+	s.reaper.Discard(ctx, existing.PhotoPublicID)
 	return nil
 }
 
@@ -192,21 +229,21 @@ func (s *Service) assertAvailable(ctx context.Context, username, email string, e
 	return nil
 }
 
-func (s *Service) uploadImage(ctx context.Context, file *multipart.FileHeader) (string, error) {
+func (s *Service) uploadImage(ctx context.Context, file *multipart.FileHeader) (storage.Uploaded, error) {
 	if file == nil {
-		return "", httpx.Validation("request validation failed").
+		return storage.Uploaded{}, httpx.Validation("request validation failed").
 			WithDetails([]httpx.FieldError{{Field: "image", Message: "is required"}})
 	}
 
 	uploaded, err := s.images.Upload(ctx, file, imageFolder)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotConfigured) {
-			return "", httpx.Unavailable("image uploads are not configured on this server").WithCause(err)
+			return storage.Uploaded{}, httpx.Unavailable("image uploads are not configured on this server").WithCause(err)
 		}
 		// A rejected file is the caller's problem; anything else is ours.
-		return "", httpx.BadRequest(err.Error()).WithCause(err)
+		return storage.Uploaded{}, httpx.BadRequest(err.Error()).WithCause(err)
 	}
-	return uploaded.URL, nil
+	return uploaded, nil
 }
 
 // validateCredentials enforces what the multipart form cannot: a parseable

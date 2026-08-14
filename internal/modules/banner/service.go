@@ -20,15 +20,22 @@ type uploader interface {
 	Upload(ctx context.Context, file *multipart.FileHeader, folder string) (storage.Uploaded, error)
 }
 
+// reaper removes assets a record no longer points at. It is an interface so a
+// test can assert that a replaced image is actually cleaned up.
+type reaper interface {
+	Discard(ctx context.Context, publicID string)
+}
+
 // Service holds the business rules.
 type Service struct {
 	repo   Repository
 	images uploader
+	reaper reaper
 	log    *slog.Logger
 }
 
-func NewService(repo Repository, images uploader, log *slog.Logger) *Service {
-	return &Service{repo: repo, images: images, log: log}
+func NewService(repo Repository, images uploader, reaper reaper, log *slog.Logger) *Service {
+	return &Service{repo: repo, images: images, reaper: reaper, log: log}
 }
 
 // List returns one page of banners for the back office.
@@ -80,19 +87,22 @@ func (s *Service) Create(ctx context.Context, input Input) (Banner, error) {
 		return Banner{}, httpx.Conflict("a banner with this name already exists")
 	}
 
-	photo, err := s.uploadImage(ctx, input.Image)
+	uploaded, err := s.uploadImage(ctx, input.Image)
 	if err != nil {
 		return Banner{}, err
 	}
 
 	created, err := s.repo.Create(ctx, Banner{
-		ID:          uuid.New(),
-		Name:        input.Name,
-		Photo:       photo,
-		Description: input.Description,
-		Status:      normalizeStatus(input.Status),
+		ID:            uuid.New(),
+		Name:          input.Name,
+		Photo:         uploaded.URL,
+		PhotoPublicID: uploaded.PublicID,
+		Description:   input.Description,
+		Status:        normalizeStatus(input.Status),
 	}, input.CreatedBy)
 	if err != nil {
+		// The upload already happened, so a failed insert would strand it.
+		s.reaper.Discard(ctx, uploaded.PublicID)
 		return Banner{}, httpx.Internal("failed to create banner").WithCause(err)
 	}
 	return created, nil
@@ -102,7 +112,8 @@ func (s *Service) Create(ctx context.Context, input Input) (Banner, error) {
 // status is deliberately untouched here: it moves only through SetStatus, which
 // is what /banner/{id}/edit-status exists for.
 func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (Banner, error) {
-	if _, err := s.repo.FindByID(ctx, id); err != nil {
+	existing, err := s.repo.FindByID(ctx, id)
+	if err != nil {
 		return Banner{}, s.translate(err, "failed to load banner")
 	}
 
@@ -114,16 +125,23 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (Banner
 		return Banner{}, httpx.Conflict("another banner already uses this name")
 	}
 
-	photo := ""
+	var uploaded storage.Uploaded
 	if input.Image != nil {
-		if photo, err = s.uploadImage(ctx, input.Image); err != nil {
+		if uploaded, err = s.uploadImage(ctx, input.Image); err != nil {
 			return Banner{}, err
 		}
 	}
 
-	updated, err := s.repo.Update(ctx, id, input.Name, input.Description, photo)
+	updated, err := s.repo.Update(ctx, id, input.Name, input.Description, uploaded.URL, uploaded.PublicID)
 	if err != nil {
+		// The row still points at the old image, so the new upload is stranded.
+		s.reaper.Discard(ctx, uploaded.PublicID)
 		return Banner{}, s.translate(err, "failed to update banner")
+	}
+
+	// Only once the row commits to the new image is the old one safe to drop.
+	if uploaded.PublicID != "" {
+		s.reaper.Discard(ctx, existing.PhotoPublicID)
 	}
 	return updated, nil
 }
@@ -138,28 +156,44 @@ func (s *Service) SetStatus(ctx context.Context, id uuid.UUID, status int) error
 
 // Delete removes a banner. Nothing references a banner, so there is no
 // foreign key to guard here.
+//
+// The row is read before it is removed, because afterwards there is nothing
+// left to learn the storage handle from.
+//
+// model.Banner carries gorm.DeletedAt, so this is a soft delete and the row
+// technically survives. The artwork is still discarded: no read path in this
+// module is Unscoped and there is no restore endpoint anywhere in the service,
+// so keeping the file would mean paying to store an image no request can ever
+// reach again. This matches typeproduct, which soft-deletes and discards too.
 func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
+	existing, err := s.repo.FindByID(ctx, id)
+	if err != nil {
+		return s.translate(err, "failed to load banner")
+	}
+
 	if err := s.repo.Delete(ctx, id); err != nil {
 		return s.translate(err, "failed to delete banner")
 	}
+
+	s.reaper.Discard(ctx, existing.PhotoPublicID)
 	return nil
 }
 
-func (s *Service) uploadImage(ctx context.Context, file *multipart.FileHeader) (string, error) {
+func (s *Service) uploadImage(ctx context.Context, file *multipart.FileHeader) (storage.Uploaded, error) {
 	if file == nil {
-		return "", httpx.Validation("request validation failed").
+		return storage.Uploaded{}, httpx.Validation("request validation failed").
 			WithDetails([]httpx.FieldError{{Field: "image", Message: "is required"}})
 	}
 
 	uploaded, err := s.images.Upload(ctx, file, imageFolder)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotConfigured) {
-			return "", httpx.Unavailable("image uploads are not configured on this server").WithCause(err)
+			return storage.Uploaded{}, httpx.Unavailable("image uploads are not configured on this server").WithCause(err)
 		}
 		// A rejected file is the caller's problem; anything else is ours.
-		return "", httpx.BadRequest(err.Error()).WithCause(err)
+		return storage.Uploaded{}, httpx.BadRequest(err.Error()).WithCause(err)
 	}
-	return uploaded.URL, nil
+	return uploaded, nil
 }
 
 // translate turns a repository error into the right HTTP status.

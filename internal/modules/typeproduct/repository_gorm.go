@@ -77,11 +77,12 @@ func (r *GormRepository) ExistsByName(ctx context.Context, name string, excludeI
 
 func (r *GormRepository) Create(ctx context.Context, row TypeProduct, createdBy uuid.UUID) (TypeProduct, error) {
 	record := model.TypeProduct{
-		ID:     row.ID,
-		Name:   row.Name,
-		Image:  row.Image,
-		Status: row.Status,
-		UserID: createdBy,
+		ID:            row.ID,
+		Name:          row.Name,
+		Image:         row.Image,
+		ImagePublicID: row.ImagePublicID,
+		Status:        row.Status,
+		UserID:        createdBy,
 	}
 	if err := r.db.WithContext(ctx).Create(&record).Error; err != nil {
 		return TypeProduct{}, fmt.Errorf("create type product: %w", err)
@@ -89,11 +90,14 @@ func (r *GormRepository) Create(ctx context.Context, row TypeProduct, createdBy 
 	return toTypeProduct(record), nil
 }
 
-func (r *GormRepository) Update(ctx context.Context, id uuid.UUID, name, image string) (TypeProduct, error) {
+func (r *GormRepository) Update(ctx context.Context, id uuid.UUID, name, image, imagePublicID string) (TypeProduct, error) {
 	updates := map[string]any{"name": name, "updated_at": time.Now().UTC()}
 	// An empty image means "keep the existing one", so it must not be written.
+	// The public id moves with the URL: writing one without the other would
+	// leave a handle pointing at an asset the record no longer shows.
 	if image != "" {
 		updates["image"] = image
+		updates["image_public_id"] = imagePublicID
 	}
 
 	result := r.db.WithContext(ctx).Model(&model.TypeProduct{}).Where("id = ?", id).Updates(updates)
@@ -147,12 +151,13 @@ func (r *GormRepository) InUse(ctx context.Context, id uuid.UUID) (bool, error) 
 
 func toTypeProduct(row model.TypeProduct) TypeProduct {
 	return TypeProduct{
-		ID:        row.ID,
-		Name:      row.Name,
-		Image:     row.Image,
-		Status:    row.Status,
-		CreatedAt: row.CreatedAt,
-		UpdatedAt: row.UpdatedAt,
+		ID:            row.ID,
+		Name:          row.Name,
+		Image:         row.Image,
+		ImagePublicID: row.ImagePublicID,
+		Status:        row.Status,
+		CreatedAt:     row.CreatedAt,
+		UpdatedAt:     row.UpdatedAt,
 	}
 }
 

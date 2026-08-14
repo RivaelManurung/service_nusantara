@@ -20,15 +20,23 @@ type uploader interface {
 	Upload(ctx context.Context, file *multipart.FileHeader, folder string) (storage.Uploaded, error)
 }
 
+// reaper removes assets a record no longer points at. It is an interface so a
+// test can assert that a replaced cover or gallery is actually cleaned up.
+type reaper interface {
+	Discard(ctx context.Context, publicID string)
+	DiscardAll(ctx context.Context, publicIDs []string)
+}
+
 // Service holds the business rules.
 type Service struct {
 	repo   Repository
 	images uploader
+	reaper reaper
 	log    *slog.Logger
 }
 
-func NewService(repo Repository, images uploader, log *slog.Logger) *Service {
-	return &Service{repo: repo, images: images, log: log}
+func NewService(repo Repository, images uploader, reaper reaper, log *slog.Logger) *Service {
+	return &Service{repo: repo, images: images, reaper: reaper, log: log}
 }
 
 // List returns one page of products.
@@ -71,6 +79,8 @@ func (s *Service) Create(ctx context.Context, input Input) (Product, error) {
 	}
 	gallery, err := s.uploadAll(ctx, input.Gallery)
 	if err != nil {
+		// The cover is already in the provider and no row will point at it.
+		s.reaper.Discard(ctx, cover.PublicID)
 		return Product{}, err
 	}
 
@@ -83,10 +93,13 @@ func (s *Service) Create(ctx context.Context, input Input) (Product, error) {
 		Status:      normalizeStatus(input.Status),
 		TypeProduct: input.TypeProduct,
 		CreatedBy:   input.CreatedBy,
-		CoverURL:    cover,
-		GalleryURLs: gallery,
+		Cover:       cover,
+		Gallery:     gallery,
 	})
 	if err != nil {
+		// The uploads already happened, so a failed insert would strand them.
+		s.reaper.Discard(ctx, cover.PublicID)
+		s.reaper.DiscardAll(ctx, publicIDsOf(gallery))
 		return Product{}, s.translate(err, "failed to create product")
 	}
 	return created, nil
@@ -99,7 +112,8 @@ func (s *Service) Create(ctx context.Context, input Input) (Product, error) {
 // through the dedicated edit-status endpoint, and accepting it here would let
 // a form that omits the field silently deactivate a product.
 func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (Product, error) {
-	if _, err := s.repo.FindByID(ctx, id); err != nil {
+	existing, err := s.repo.FindByID(ctx, id)
+	if err != nil {
 		return Product{}, s.translate(err, "failed to load product")
 	}
 	if err := s.checkName(ctx, input.Name, id); err != nil {
@@ -109,9 +123,8 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (Produc
 		return Product{}, err
 	}
 
-	cover := ""
+	var cover UploadedImage
 	if input.Cover != nil {
-		var err error
 		if cover, err = s.upload(ctx, input.Cover); err != nil {
 			return Product{}, err
 		}
@@ -119,6 +132,8 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (Produc
 
 	gallery, err := s.uploadAll(ctx, input.Gallery)
 	if err != nil {
+		// The row still points at the old cover, so the new one is stranded.
+		s.reaper.Discard(ctx, cover.PublicID)
 		return Product{}, err
 	}
 
@@ -129,12 +144,24 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (Produc
 		Unit:           input.Unit,
 		Description:    input.Description,
 		TypeProduct:    input.TypeProduct,
-		CoverURL:       cover,
-		GalleryURLs:    gallery,
+		Cover:          cover,
+		Gallery:        gallery,
 		ReplaceGallery: input.ReplaceGallery,
 	})
 	if err != nil {
+		// Nothing changed, so every new upload is stranded.
+		s.reaper.Discard(ctx, cover.PublicID)
+		s.reaper.DiscardAll(ctx, publicIDsOf(gallery))
 		return Product{}, s.translate(err, "failed to update product")
+	}
+
+	// Only once the row commits to the new images are the old ones safe to drop.
+	if cover.PublicID != "" && existing.Image != nil {
+		s.reaper.Discard(ctx, existing.Image.PublicID)
+	}
+	if input.ReplaceGallery {
+		// The whole stored gallery was unlinked, not just the cover.
+		s.reaper.DiscardAll(ctx, galleryPublicIDs(existing))
 	}
 	return updated, nil
 }
@@ -147,11 +174,23 @@ func (s *Service) SetStatus(ctx context.Context, id uuid.UUID, status int) error
 	return nil
 }
 
-// Delete removes a product together with its gallery links.
+// Delete removes a product together with its gallery links, then drops the
+// images themselves. The row is read first because once it is gone there is no
+// way left to find out which assets belonged to it.
 func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
+	existing, err := s.repo.FindByID(ctx, id)
+	if err != nil {
+		return s.translate(err, "failed to load product")
+	}
+
 	if err := s.repo.Delete(ctx, id); err != nil {
 		return s.translate(err, "failed to delete product")
 	}
+
+	if existing.Image != nil {
+		s.reaper.Discard(ctx, existing.Image.PublicID)
+	}
+	s.reaper.DiscardAll(ctx, galleryPublicIDs(existing))
 	return nil
 }
 
@@ -180,34 +219,57 @@ func (s *Service) checkTypeProduct(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-func (s *Service) upload(ctx context.Context, file *multipart.FileHeader) (string, error) {
+func (s *Service) upload(ctx context.Context, file *multipart.FileHeader) (UploadedImage, error) {
 	uploaded, err := s.images.Upload(ctx, file, imageFolder)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotConfigured) {
-			return "", httpx.Unavailable("image uploads are not configured on this server").WithCause(err)
+			return UploadedImage{}, httpx.Unavailable("image uploads are not configured on this server").WithCause(err)
 		}
 		// A rejected file is the caller's problem; anything else is ours.
-		return "", httpx.BadRequest(err.Error()).WithCause(err)
+		return UploadedImage{}, httpx.BadRequest(err.Error()).WithCause(err)
 	}
-	return uploaded.URL, nil
+	return UploadedImage{URL: uploaded.URL, PublicID: uploaded.PublicID}, nil
 }
 
-// uploadAll stores a gallery in order. It stops at the first failure: the
-// caller has not written anything yet, so nothing has to be undone.
-func (s *Service) uploadAll(ctx context.Context, files []*multipart.FileHeader) ([]string, error) {
+// uploadAll stores a gallery in order. It stops at the first failure and drops
+// whatever already reached the provider, because nothing will be written and an
+// abandoned half-gallery would be invisible to every later cleanup.
+func (s *Service) uploadAll(ctx context.Context, files []*multipart.FileHeader) ([]UploadedImage, error) {
 	if len(files) == 0 {
 		return nil, nil
 	}
 
-	urls := make([]string, 0, len(files))
+	uploads := make([]UploadedImage, 0, len(files))
 	for _, file := range files {
-		url, err := s.upload(ctx, file)
+		uploaded, err := s.upload(ctx, file)
 		if err != nil {
+			s.reaper.DiscardAll(ctx, publicIDsOf(uploads))
 			return nil, err
 		}
-		urls = append(urls, url)
+		uploads = append(uploads, uploaded)
 	}
-	return urls, nil
+	return uploads, nil
+}
+
+// publicIDsOf collects the storage handles of freshly uploaded images.
+func publicIDsOf(uploads []UploadedImage) []string {
+	ids := make([]string, 0, len(uploads))
+	for _, upload := range uploads {
+		ids = append(ids, upload.PublicID)
+	}
+	return ids
+}
+
+// galleryPublicIDs collects the storage handles a stored product's gallery
+// points at.
+func galleryPublicIDs(item Product) []string {
+	ids := make([]string, 0, len(item.ProductImages))
+	for _, gallery := range item.ProductImages {
+		if gallery.Image != nil {
+			ids = append(ids, gallery.Image.PublicID)
+		}
+	}
+	return ids
 }
 
 // translate turns a repository error into the right HTTP status.

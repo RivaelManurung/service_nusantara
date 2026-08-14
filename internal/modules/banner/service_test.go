@@ -28,6 +28,9 @@ type fakeRepo struct {
 	rows      map[uuid.UUID]banner.Banner
 	failOn    error
 	lastPhoto string
+	// failWrites, when set, is returned by Create, Update and Delete so a test
+	// can drive the "the upload happened but the row did not" path.
+	failWrites error
 }
 
 func newFakeRepo() *fakeRepo {
@@ -84,12 +87,18 @@ func (f *fakeRepo) ExistsByName(_ context.Context, name string, excludeID uuid.U
 }
 
 func (f *fakeRepo) Create(_ context.Context, row banner.Banner, createdBy uuid.UUID) (banner.Banner, error) {
+	if f.failWrites != nil {
+		return banner.Banner{}, f.failWrites
+	}
 	f.rows[row.ID] = row
 	f.lastPhoto = row.Photo
 	return row, nil
 }
 
-func (f *fakeRepo) Update(_ context.Context, id uuid.UUID, name, description, photo string) (banner.Banner, error) {
+func (f *fakeRepo) Update(_ context.Context, id uuid.UUID, name, description, photo, photoPublicID string) (banner.Banner, error) {
+	if f.failWrites != nil {
+		return banner.Banner{}, f.failWrites
+	}
 	row, ok := f.rows[id]
 	if !ok {
 		return banner.Banner{}, banner.ErrNotFound
@@ -98,6 +107,7 @@ func (f *fakeRepo) Update(_ context.Context, id uuid.UUID, name, description, ph
 	row.Description = description
 	if photo != "" {
 		row.Photo = photo
+		row.PhotoPublicID = photoPublicID
 	}
 	f.rows[id] = row
 	return row, nil
@@ -117,14 +127,18 @@ func (f *fakeRepo) Delete(_ context.Context, id uuid.UUID) error {
 	if _, ok := f.rows[id]; !ok {
 		return banner.ErrNotFound
 	}
+	if f.failWrites != nil {
+		return f.failWrites
+	}
 	delete(f.rows, id)
 	return nil
 }
 
 type fakeUploader struct {
-	url  string
-	err  error
-	call int
+	url      string
+	publicID string
+	err      error
+	call     int
 }
 
 func (f *fakeUploader) Upload(context.Context, *multipart.FileHeader, string) (storage.Uploaded, error) {
@@ -132,11 +146,34 @@ func (f *fakeUploader) Upload(context.Context, *multipart.FileHeader, string) (s
 	if f.err != nil {
 		return storage.Uploaded{}, f.err
 	}
-	return storage.Uploaded{URL: f.url, PublicID: "public-id"}, nil
+	publicID := f.publicID
+	if publicID == "" {
+		publicID = "public-id"
+	}
+	return storage.Uploaded{URL: f.url, PublicID: publicID}, nil
+}
+
+// fakeReaper records what the service asked to have deleted, which is the only
+// way to prove an orphan was cleaned up without talking to a provider.
+type fakeReaper struct {
+	discarded []string
+}
+
+func (f *fakeReaper) Discard(_ context.Context, publicID string) {
+	if publicID == "" {
+		// The real Reaper ignores empty ids; recording them would make every
+		// assertion below depend on how many no-op calls happened to be made.
+		return
+	}
+	f.discarded = append(f.discarded, publicID)
 }
 
 func newService(repo banner.Repository, images *fakeUploader) *banner.Service {
-	return banner.NewService(repo, images, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return newServiceWithReaper(repo, images, &fakeReaper{})
+}
+
+func newServiceWithReaper(repo banner.Repository, images *fakeUploader, cleaner *fakeReaper) *banner.Service {
+	return banner.NewService(repo, images, cleaner, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func anyFile() *multipart.FileHeader {
@@ -342,6 +379,141 @@ func TestDeleteOfAMissingBannerIsNotFound(t *testing.T) {
 	err := service.Delete(context.Background(), uuid.New())
 
 	assert.Equal(t, http.StatusNotFound, statusOf(t, err))
+}
+
+// --- image cleanup -----------------------------------------------------
+
+func TestCreatePersistsTheStorageHandle(t *testing.T) {
+	repo := newFakeRepo()
+	images := &fakeUploader{url: "https://cdn.example/new.png", publicID: "banners/new"}
+	service := newService(repo, images)
+
+	created, err := service.Create(context.Background(), banner.Input{
+		Name: "Handle", Description: "…", Image: anyFile(),
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "banners/new", created.PhotoPublicID,
+		"without the handle nothing can ever delete this asset")
+}
+
+func TestCreateDiscardsTheUploadWhenTheInsertFails(t *testing.T) {
+	repo := newFakeRepo()
+	repo.failWrites = errors.New("insert exploded")
+	images := &fakeUploader{url: "https://cdn.example/new.png", publicID: "banners/new"}
+	cleaner := &fakeReaper{}
+	service := newServiceWithReaper(repo, images, cleaner)
+
+	_, err := service.Create(context.Background(), banner.Input{
+		Name: "Doomed", Description: "…", Image: anyFile(),
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, []string{"banners/new"}, cleaner.discarded,
+		"an upload with no row to point at it must not be left behind")
+}
+
+func TestUpdateDiscardsTheOldImageOnlyAfterTheRowCommits(t *testing.T) {
+	repo := newFakeRepo()
+	id := uuid.New()
+	repo.rows[id] = banner.Banner{
+		ID: id, Name: "Old",
+		Photo: "https://cdn.example/old.png", PhotoPublicID: "banners/old",
+	}
+	images := &fakeUploader{url: "https://cdn.example/new.png", publicID: "banners/new"}
+	cleaner := &fakeReaper{}
+	service := newServiceWithReaper(repo, images, cleaner)
+
+	updated, err := service.Update(context.Background(), id, banner.Input{
+		Name: "New", Description: "…", Image: anyFile(),
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "banners/new", updated.PhotoPublicID)
+	assert.Equal(t, []string{"banners/old"}, cleaner.discarded,
+		"the replaced artwork is the one that must go, not the new one")
+}
+
+func TestUpdateDiscardsTheNewImageWhenTheRowFailsToWrite(t *testing.T) {
+	repo := newFakeRepo()
+	id := uuid.New()
+	repo.rows[id] = banner.Banner{
+		ID: id, Name: "Old",
+		Photo: "https://cdn.example/old.png", PhotoPublicID: "banners/old",
+	}
+	repo.failWrites = errors.New("update exploded")
+	images := &fakeUploader{url: "https://cdn.example/new.png", publicID: "banners/new"}
+	cleaner := &fakeReaper{}
+	service := newServiceWithReaper(repo, images, cleaner)
+
+	_, err := service.Update(context.Background(), id, banner.Input{
+		Name: "New", Description: "…", Image: anyFile(),
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, []string{"banners/new"}, cleaner.discarded,
+		"the row still shows the old artwork, so only the new upload is stranded")
+}
+
+func TestUpdateWithoutAFileDiscardsNothing(t *testing.T) {
+	repo := newFakeRepo()
+	id := uuid.New()
+	repo.rows[id] = banner.Banner{ID: id, Name: "Old", PhotoPublicID: "banners/old"}
+	cleaner := &fakeReaper{}
+	service := newServiceWithReaper(repo, &fakeUploader{}, cleaner)
+
+	_, err := service.Update(context.Background(), id, banner.Input{Name: "New", Description: "…"})
+
+	require.NoError(t, err)
+	assert.Empty(t, cleaner.discarded, "the row still points at that image")
+}
+
+func TestDeleteDiscardsTheBannersImage(t *testing.T) {
+	repo := newFakeRepo()
+	id := uuid.New()
+	repo.rows[id] = banner.Banner{ID: id, Name: "Gone", PhotoPublicID: "banners/gone"}
+	cleaner := &fakeReaper{}
+	service := newServiceWithReaper(repo, &fakeUploader{}, cleaner)
+
+	require.NoError(t, service.Delete(context.Background(), id))
+
+	assert.Equal(t, []string{"banners/gone"}, cleaner.discarded)
+}
+
+func TestDeleteDiscardsNothingWhenTheRowSurvives(t *testing.T) {
+	repo := newFakeRepo()
+	id := uuid.New()
+	repo.rows[id] = banner.Banner{ID: id, Name: "Stays", PhotoPublicID: "banners/stays"}
+	repo.failWrites = errors.New("delete exploded")
+	cleaner := &fakeReaper{}
+	service := newServiceWithReaper(repo, &fakeUploader{}, cleaner)
+
+	require.Error(t, service.Delete(context.Background(), id))
+
+	assert.Empty(t, cleaner.discarded, "a row that is still there must keep its image")
+}
+
+// discardPanics stands in for a storage provider that is down. The real Reaper
+// swallows that failure; this asserts the service does not depend on it doing
+// so being optional -- a discard must never turn into the caller's error.
+type recordingFailReaper struct{ calls int }
+
+func (r *recordingFailReaper) Discard(context.Context, string) { r.calls++ }
+
+func TestADiscardNeverFailsTheRequest(t *testing.T) {
+	repo := newFakeRepo()
+	id := uuid.New()
+	repo.rows[id] = banner.Banner{ID: id, Name: "Old", PhotoPublicID: "banners/old"}
+	cleaner := &recordingFailReaper{}
+	service := banner.NewService(repo, &fakeUploader{url: "https://cdn.example/new.png"},
+		cleaner, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	_, err := service.Update(context.Background(), id, banner.Input{
+		Name: "New", Description: "…", Image: anyFile(),
+	})
+
+	require.NoError(t, err, "cleanup is best effort and must not surface to the caller")
+	assert.Equal(t, 1, cleaner.calls)
 }
 
 func TestPublicReadsOnlySeeActiveBanners(t *testing.T) {

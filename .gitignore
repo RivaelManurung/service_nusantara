@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 
+# Rendered seed placeholders: reproducible with
+# `python3 tools/generate-seed-images.py`, so they are not checked in.
+/images/
+
 # Build output
 /bin/
 /tmp/

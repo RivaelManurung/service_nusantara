@@ -78,6 +78,19 @@ type Shop struct {
 	ShopImages   []string      `json:"shop_images"`
 	ShopProducts []ShopProduct `json:"shop_product"`
 	ShopCashiers []Cashier     `json:"shop_cashier"`
+
+	// The public ids are the storage provider's own handles, never part of the
+	// client contract. They exist so a replaced or deleted picture can actually
+	// be removed: a URL cannot address the file in the provider.
+	CoverPublicID    string   `json:"-"`
+	GalleryPublicIDs []string `json:"-"`
+}
+
+// GalleryImage is one stored gallery picture: the URL the client reads, plus
+// the handle that can delete it later.
+type GalleryImage struct {
+	URL      string
+	PublicID string
 }
 
 // AssignedShop is one entry of GET /cashier/shop-names.
@@ -177,7 +190,10 @@ type Record struct {
 	Lng         *float64
 	Status      int
 	Cover       string
-	CreatedBy   uuid.UUID
+	// CoverPublicID travels with Cover and is only written alongside it, so the
+	// handle can never point at an asset the row no longer shows.
+	CoverPublicID string
+	CreatedBy     uuid.UUID
 }
 
 // ProductLine is a fully resolved shop_products row: the caller's overrides
@@ -193,7 +209,7 @@ type ProductLine struct {
 // together so the repository can commit them in one transaction: a shop whose
 // staff were saved but whose stock was not is worse than a failed request.
 type Assignments struct {
-	Gallery        []string
+	Gallery        []GalleryImage
 	ReplaceGallery bool
 
 	Cashiers    []uuid.UUID

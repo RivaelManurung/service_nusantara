@@ -33,6 +33,9 @@ type fakeRepo struct {
 	rows      map[uuid.UUID]*stored
 	roleNames map[string]uuid.UUID
 	failOn    error
+	// failWrites, when set, is returned by Create, Update and Delete so a test
+	// can drive the "the upload happened but the row did not" path.
+	failWrites error
 }
 
 func newFakeRepo() *fakeRepo {
@@ -88,15 +91,21 @@ func (f *fakeRepo) FindRoleIDByName(_ context.Context, name string) (uuid.UUID, 
 }
 
 func (f *fakeRepo) Create(_ context.Context, row cashier.Cashier, passwordHash string, roleID uuid.UUID) (cashier.Cashier, error) {
+	if f.failWrites != nil {
+		return cashier.Cashier{}, f.failWrites
+	}
 	row.Role = cashier.RoleName
 	f.rows[row.ID] = &stored{row: row, passwordHash: passwordHash, roleID: roleID}
 	return row, nil
 }
 
-func (f *fakeRepo) Update(_ context.Context, id uuid.UUID, name, username, photo string, status *int) (cashier.Cashier, error) {
+func (f *fakeRepo) Update(_ context.Context, id uuid.UUID, name, username, photo, photoPublicID string, status *int) (cashier.Cashier, error) {
 	entry, ok := f.rows[id]
 	if !ok {
 		return cashier.Cashier{}, cashier.ErrNotFound
+	}
+	if f.failWrites != nil {
+		return cashier.Cashier{}, f.failWrites
 	}
 	if name != "" {
 		entry.row.Name = name
@@ -106,6 +115,7 @@ func (f *fakeRepo) Update(_ context.Context, id uuid.UUID, name, username, photo
 	}
 	if photo != "" {
 		entry.row.Photo = photo
+		entry.row.PhotoPublicID = photoPublicID
 	}
 	if status != nil {
 		entry.row.Status = *status
@@ -117,14 +127,18 @@ func (f *fakeRepo) Delete(_ context.Context, id uuid.UUID) error {
 	if _, ok := f.rows[id]; !ok {
 		return cashier.ErrNotFound
 	}
+	if f.failWrites != nil {
+		return f.failWrites
+	}
 	delete(f.rows, id)
 	return nil
 }
 
 type fakeUploader struct {
-	url  string
-	err  error
-	call int
+	url      string
+	publicID string
+	err      error
+	call     int
 }
 
 func (f *fakeUploader) Upload(context.Context, *multipart.FileHeader, string) (storage.Uploaded, error) {
@@ -132,13 +146,36 @@ func (f *fakeUploader) Upload(context.Context, *multipart.FileHeader, string) (s
 	if f.err != nil {
 		return storage.Uploaded{}, f.err
 	}
-	return storage.Uploaded{URL: f.url, PublicID: "public-id"}, nil
+	publicID := f.publicID
+	if publicID == "" {
+		publicID = "public-id"
+	}
+	return storage.Uploaded{URL: f.url, PublicID: publicID}, nil
+}
+
+// fakeReaper records what the service asked to have deleted, which is the only
+// way to prove an orphan was cleaned up without talking to a provider.
+type fakeReaper struct {
+	discarded []string
+}
+
+func (f *fakeReaper) Discard(_ context.Context, publicID string) {
+	if publicID == "" {
+		// The real Reaper ignores empty ids; recording them would make every
+		// assertion below depend on how many no-op calls happened to be made.
+		return
+	}
+	f.discarded = append(f.discarded, publicID)
 }
 
 func newService(repo cashier.Repository, images *fakeUploader) *cashier.Service {
+	return newServiceWithReaper(repo, images, &fakeReaper{})
+}
+
+func newServiceWithReaper(repo cashier.Repository, images *fakeUploader, cleaner *fakeReaper) *cashier.Service {
 	// The real hasher, at the cheapest legal cost: hashing is the behaviour
 	// under test, so faking it would test nothing.
-	return cashier.NewService(repo, images, auth.NewHasher(4),
+	return cashier.NewService(repo, images, cleaner, auth.NewHasher(4),
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
@@ -425,6 +462,135 @@ func TestDeleteOfAMissingCashierIsNotFound(t *testing.T) {
 	err := service.Delete(context.Background(), uuid.New())
 
 	assert.Equal(t, http.StatusNotFound, statusOf(t, err))
+}
+
+// --- image cleanup -----------------------------------------------------
+
+func TestCreatePersistsTheStorageHandle(t *testing.T) {
+	repo := newFakeRepo()
+	service := newService(repo, &fakeUploader{url: "https://cdn.example/a.png", publicID: "cashiers/a"})
+
+	created, err := service.Create(context.Background(), validInput())
+
+	require.NoError(t, err)
+	assert.Equal(t, "cashiers/a", created.PhotoPublicID,
+		"without the handle nothing can ever delete this asset")
+	assert.NotContains(t, marshal(t, created), "cashiers/a",
+		"the handle is internal and must not reach the client")
+}
+
+func TestCreateDiscardsTheUploadWhenTheInsertFails(t *testing.T) {
+	repo := newFakeRepo()
+	repo.failWrites = errors.New("insert exploded")
+	cleaner := &fakeReaper{}
+	service := newServiceWithReaper(repo,
+		&fakeUploader{url: "https://cdn.example/a.png", publicID: "cashiers/a"}, cleaner)
+
+	_, err := service.Create(context.Background(), validInput())
+
+	require.Error(t, err)
+	assert.Equal(t, []string{"cashiers/a"}, cleaner.discarded,
+		"an upload with no account to point at it must not be left behind")
+}
+
+func TestUpdateDiscardsTheOldPhotoOnlyAfterTheRowCommits(t *testing.T) {
+	repo := newFakeRepo()
+	cleaner := &fakeReaper{}
+	images := &fakeUploader{url: "https://cdn.example/old.png", publicID: "cashiers/old"}
+	service := newServiceWithReaper(repo, images, cleaner)
+	created, err := service.Create(context.Background(), validInput())
+	require.NoError(t, err)
+
+	images.url, images.publicID = "https://cdn.example/new.png", "cashiers/new"
+	updated, err := service.Update(context.Background(), created.ID, cashier.UpdateInput{
+		Image: anyFile(),
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "cashiers/new", updated.PhotoPublicID)
+	assert.Equal(t, []string{"cashiers/old"}, cleaner.discarded,
+		"the replaced photo is the one that must go, not the new one")
+}
+
+func TestUpdateDiscardsTheNewPhotoWhenTheRowFailsToWrite(t *testing.T) {
+	repo := newFakeRepo()
+	cleaner := &fakeReaper{}
+	images := &fakeUploader{url: "https://cdn.example/old.png", publicID: "cashiers/old"}
+	service := newServiceWithReaper(repo, images, cleaner)
+	created, err := service.Create(context.Background(), validInput())
+	require.NoError(t, err)
+
+	repo.failWrites = errors.New("update exploded")
+	images.url, images.publicID = "https://cdn.example/new.png", "cashiers/new"
+	_, err = service.Update(context.Background(), created.ID, cashier.UpdateInput{Image: anyFile()})
+
+	require.Error(t, err)
+	assert.Equal(t, []string{"cashiers/new"}, cleaner.discarded,
+		"the row still shows the old photo, so only the new upload is stranded")
+}
+
+func TestUpdateWithoutAFileDiscardsNothing(t *testing.T) {
+	repo := newFakeRepo()
+	cleaner := &fakeReaper{}
+	service := newServiceWithReaper(repo,
+		&fakeUploader{url: "https://cdn.example/a.png", publicID: "cashiers/a"}, cleaner)
+	created, err := service.Create(context.Background(), validInput())
+	require.NoError(t, err)
+
+	name := "Siti Rahma"
+	_, err = service.Update(context.Background(), created.ID, cashier.UpdateInput{Name: &name})
+
+	require.NoError(t, err)
+	assert.Empty(t, cleaner.discarded, "the account still points at that photo")
+}
+
+func TestDeleteDiscardsTheCashiersPhoto(t *testing.T) {
+	repo := newFakeRepo()
+	cleaner := &fakeReaper{}
+	service := newServiceWithReaper(repo,
+		&fakeUploader{url: "https://cdn.example/a.png", publicID: "cashiers/a"}, cleaner)
+	created, err := service.Create(context.Background(), validInput())
+	require.NoError(t, err)
+
+	require.NoError(t, service.Delete(context.Background(), created.ID))
+
+	assert.Equal(t, []string{"cashiers/a"}, cleaner.discarded)
+}
+
+func TestDeleteDiscardsNothingWhenTheRowSurvives(t *testing.T) {
+	repo := newFakeRepo()
+	cleaner := &fakeReaper{}
+	service := newServiceWithReaper(repo,
+		&fakeUploader{url: "https://cdn.example/a.png", publicID: "cashiers/a"}, cleaner)
+	created, err := service.Create(context.Background(), validInput())
+	require.NoError(t, err)
+
+	repo.failWrites = errors.New("delete exploded")
+	require.Error(t, service.Delete(context.Background(), created.ID))
+
+	assert.Empty(t, cleaner.discarded, "an account that is still there must keep its photo")
+}
+
+// countingReaper stands in for a storage provider that is down: the real Reaper
+// logs and returns, so a failure there must never reach the caller.
+type countingReaper struct{ calls int }
+
+func (r *countingReaper) Discard(context.Context, string) { r.calls++ }
+
+func TestADiscardNeverFailsTheRequest(t *testing.T) {
+	repo := newFakeRepo()
+	cleaner := &countingReaper{}
+	images := &fakeUploader{url: "https://cdn.example/a.png", publicID: "cashiers/a"}
+	service := cashier.NewService(repo, images, cleaner, auth.NewHasher(4),
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	created, err := service.Create(context.Background(), validInput())
+	require.NoError(t, err)
+
+	_, err = service.Update(context.Background(), created.ID, cashier.UpdateInput{Image: anyFile()})
+
+	require.NoError(t, err, "cleanup is best effort and must not surface to the caller")
+	assert.Equal(t, 1, cleaner.calls)
 }
 
 func TestRepositoryFailuresNeverLeakTheDriverMessage(t *testing.T) {

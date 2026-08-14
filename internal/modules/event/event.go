@@ -81,6 +81,11 @@ type Event struct {
 	Cover     string    `json:"cover"`
 	Status    int       `json:"status"`
 
+	// CoverPublicID is the storage handle, never part of the client contract.
+	// It exists so a replaced or deleted cover can actually be removed: the URL
+	// alone cannot address the file in the provider.
+	CoverPublicID string `json:"-"`
+
 	EventProducts      []ProductDiscount `json:"event_product"`
 	EventBundleBuys    []BundleItem      `json:"event_bundle_buy"`
 	EventBundleRewards []BundleItem      `json:"event_bundle_reward"`
@@ -161,7 +166,8 @@ type Repository interface {
 	// Create writes the event and its children in one transaction.
 	Create(ctx context.Context, row Event, children Children, createdBy uuid.UUID) (Event, error)
 	// Update rewrites the event and replaces every child row, in one
-	// transaction. An empty Cover keeps the stored one.
+	// transaction. An empty Cover keeps the stored one, and the public id moves
+	// with it so the handle can never point at an asset the row no longer shows.
 	Update(ctx context.Context, id uuid.UUID, row Event, children Children) (Event, error)
 	UpdateStatus(ctx context.Context, id uuid.UUID, status int) error
 	Delete(ctx context.Context, id uuid.UUID) error

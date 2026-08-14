@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -24,16 +25,33 @@ func newGormLogger(log *slog.Logger, slowThreshold time.Duration) gormlogger.Int
 // LogMode is part of the interface; levels are controlled by the slog handler.
 func (a *slogAdapter) LogMode(gormlogger.LogLevel) gormlogger.Interface { return a }
 
+// GORM passes a printf-style format string plus its arguments. Rendering them
+// here does two things the previous slog.Any("args", args) did not: it produces
+// the message GORM actually meant, and it cannot fail.
+//
+// slog.Any handed the raw arguments to the JSON handler, and those arguments
+// include gorm.Config -- which carries a NowFunc field of type func() time.Time.
+// encoding/json cannot marshal a func, so every GORM diagnostic came out as
+// `"args":"!ERROR:json: unsupported type: func() time.Time"` with the real
+// message discarded. A logger that destroys the error it was handed is worse
+// than no logger at all.
+func (a *slogAdapter) render(msg string, args ...any) string {
+	if len(args) == 0 {
+		return msg
+	}
+	return fmt.Sprintf(msg, args...)
+}
+
 func (a *slogAdapter) Info(ctx context.Context, msg string, args ...any) {
-	a.log.InfoContext(ctx, msg, slog.Any("args", args))
+	a.log.InfoContext(ctx, a.render(msg, args...))
 }
 
 func (a *slogAdapter) Warn(ctx context.Context, msg string, args ...any) {
-	a.log.WarnContext(ctx, msg, slog.Any("args", args))
+	a.log.WarnContext(ctx, a.render(msg, args...))
 }
 
 func (a *slogAdapter) Error(ctx context.Context, msg string, args ...any) {
-	a.log.ErrorContext(ctx, msg, slog.Any("args", args))
+	a.log.ErrorContext(ctx, a.render(msg, args...))
 }
 
 // Trace records one statement. Only failures and slow queries are reported at

@@ -36,6 +36,11 @@ const MaxGalleryFiles = 10
 // entity directly; keeping the nesting keeps the UI working.
 type Image struct {
 	ImagePath string `json:"image_path"`
+
+	// PublicID is the storage handle, never part of the client contract. It
+	// exists so a replaced or deleted image can actually be removed instead of
+	// being orphaned in the provider forever.
+	PublicID string `json:"-"`
 }
 
 // TypeProductRef is the category as embedded in a product response.
@@ -101,9 +106,17 @@ type Input struct {
 	CreatedBy uuid.UUID
 }
 
-// Write is what the repository persists: the scalar columns plus the image
-// URLs the service has already uploaded. Uploading first means a storage
-// failure never leaves a row pointing at an image that was never stored.
+// UploadedImage is an asset that already reached the storage provider: the URL
+// the client renders plus the handle that is the only way to delete it later.
+// Both travel together so a row can never store one without the other.
+type UploadedImage struct {
+	URL      string
+	PublicID string
+}
+
+// Write is what the repository persists: the scalar columns plus the images the
+// service has already uploaded. Uploading first means a storage failure never
+// leaves a row pointing at an image that was never stored.
 type Write struct {
 	Name        string
 	Code        string
@@ -114,11 +127,11 @@ type Write struct {
 	TypeProduct uuid.UUID
 	CreatedBy   uuid.UUID
 
-	// CoverURL is empty on update when the cover is unchanged.
-	CoverURL string
-	// GalleryURLs are new images to link to the product.
-	GalleryURLs []string
-	// ReplaceGallery unlinks the stored gallery before linking GalleryURLs.
+	// Cover is zero on update when the cover is unchanged.
+	Cover UploadedImage
+	// Gallery are new images to link to the product.
+	Gallery []UploadedImage
+	// ReplaceGallery unlinks the stored gallery before linking Gallery.
 	ReplaceGallery bool
 }
 

@@ -21,7 +21,6 @@ import (
 
 	"service_nusantara/internal/auth"
 	"service_nusantara/internal/config"
-	"service_nusantara/internal/model"
 	"service_nusantara/internal/platform/database"
 	"service_nusantara/internal/platform/logging"
 	"service_nusantara/internal/seed"
@@ -44,7 +43,7 @@ func run() error {
 		reset           = flag.Bool("truncate", false, "reset the seeded tables before seeding (destructive)")
 		confirm         = flag.Bool("yes", false, "confirm a destructive run; required with -truncate")
 		scale           = flag.Int("scale", 1, "multiplier for generated customers (1 = fixtures only)")
-		migrate         = flag.Bool("migrate", false, "run AutoMigrate before seeding")
+		migrate         = flag.Bool("migrate", false, "apply pending SQL migrations before seeding")
 		allowProduction = flag.Bool("allow-production", false, "permit seeding when APP_ENV=production")
 	)
 	flag.Usage = usage
@@ -81,8 +80,10 @@ func run() error {
 	}()
 
 	if *migrate {
-		log.Info("running AutoMigrate before seeding")
-		if err := model.AutoMigrate(ctx, db); err != nil {
+		// The SQL history, not AutoMigrate. The runtime image is distroless and
+		// has no shell, so a pre-deploy step cannot chain `migrate && seed`;
+		// folding the migration in here keeps it one binary invocation.
+		if err := database.Migrate(ctx, db, log); err != nil {
 			return err
 		}
 	}

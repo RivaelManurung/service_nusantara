@@ -91,11 +91,11 @@ func (f *fakeRepo) Create(_ context.Context, write product.Write) (product.Produ
 		Code:   write.Code,
 		Price:  write.Price,
 		Status: write.Status,
-		Image:  &product.Image{ImagePath: write.CoverURL},
+		Image:  &product.Image{ImagePath: write.Cover.URL, PublicID: write.Cover.PublicID},
 	}
-	for _, url := range write.GalleryURLs {
+	for _, upload := range write.Gallery {
 		item.ProductImages = append(item.ProductImages, product.GalleryImage{
-			Image: &product.Image{ImagePath: url},
+			Image: &product.Image{ImagePath: upload.URL, PublicID: upload.PublicID},
 		})
 	}
 	f.items[id] = item
@@ -115,15 +115,15 @@ func (f *fakeRepo) Update(_ context.Context, id uuid.UUID, write product.Write) 
 	item.Name = write.Name
 	item.Code = write.Code
 	item.Price = write.Price
-	if write.CoverURL != "" {
-		item.Image = &product.Image{ImagePath: write.CoverURL}
+	if write.Cover.URL != "" {
+		item.Image = &product.Image{ImagePath: write.Cover.URL, PublicID: write.Cover.PublicID}
 	}
 	if write.ReplaceGallery {
 		item.ProductImages = nil
 	}
-	for _, url := range write.GalleryURLs {
+	for _, upload := range write.Gallery {
 		item.ProductImages = append(item.ProductImages, product.GalleryImage{
-			Image: &product.Image{ImagePath: url},
+			Image: &product.Image{ImagePath: upload.URL, PublicID: upload.PublicID},
 		})
 	}
 	f.items[id] = item
@@ -167,6 +167,24 @@ func (f *fakeUploader) Upload(_ context.Context, file *multipart.FileHeader, fol
 	}, nil
 }
 
+// fakeReaper records what the service asked to have removed from the provider.
+type fakeReaper struct {
+	discarded []string
+}
+
+func (f *fakeReaper) Discard(_ context.Context, publicID string) {
+	if publicID == "" {
+		return
+	}
+	f.discarded = append(f.discarded, publicID)
+}
+
+func (f *fakeReaper) DiscardAll(ctx context.Context, publicIDs []string) {
+	for _, id := range publicIDs {
+		f.Discard(ctx, id)
+	}
+}
+
 // --- helpers -----------------------------------------------------------
 
 func fileHeader(name string) *multipart.FileHeader {
@@ -174,7 +192,11 @@ func fileHeader(name string) *multipart.FileHeader {
 }
 
 func newService(repo *fakeRepo, images *fakeUploader) *product.Service {
-	return product.NewService(repo, images, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return newServiceWithReaper(repo, images, &fakeReaper{})
+}
+
+func newServiceWithReaper(repo *fakeRepo, images *fakeUploader, reaper *fakeReaper) *product.Service {
+	return product.NewService(repo, images, reaper, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func validInput(typeID uuid.UUID) product.Input {
@@ -216,11 +238,11 @@ func TestCreateUploadsCoverAndGalleryBeforePersisting(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	require.Len(t, repo.writes, 1)
-	assert.Equal(t, "https://cdn.test/products/cover.jpg", repo.writes[0].CoverURL)
-	assert.Equal(t, []string{
-		"https://cdn.test/products/a.jpg",
-		"https://cdn.test/products/b.png",
-	}, repo.writes[0].GalleryURLs)
+	assert.Equal(t, "https://cdn.test/products/cover.jpg", repo.writes[0].Cover.URL)
+	assert.Equal(t, []product.UploadedImage{
+		{URL: "https://cdn.test/products/a.jpg", PublicID: "products/a.jpg"},
+		{URL: "https://cdn.test/products/b.png", PublicID: "products/b.png"},
+	}, repo.writes[0].Gallery)
 	assert.Len(t, created.ProductImages, 2)
 	assert.Equal(t, 3, images.calls)
 }
@@ -263,17 +285,39 @@ func TestCreateWritesNothingWhenAGalleryUploadFails(t *testing.T) {
 	typeID := uuid.New()
 	repo.types[typeID] = true
 	images := &fakeUploader{failAfter: 2, err: errors.New("provider exploded")}
+	reaper := &fakeReaper{}
 
 	input := validInput(typeID)
 	input.Gallery = []*multipart.FileHeader{fileHeader("a.jpg"), fileHeader("b.jpg")}
 
 	// Act
-	_, err := newService(repo, images).Create(context.Background(), input)
+	_, err := newServiceWithReaper(repo, images, reaper).Create(context.Background(), input)
 
-	// Assert: a partial gallery must never reach the database.
+	// Assert: a partial gallery must never reach the database, and what did
+	// reach the provider must not be left behind.
 	require.Error(t, err)
 	assert.Empty(t, repo.writes)
 	assert.Empty(t, repo.items)
+	assert.ElementsMatch(t, []string{"products/cover.jpg", "products/a.jpg"}, reaper.discarded)
+}
+
+func TestCreateDiscardsEveryUploadWhenTheInsertFails(t *testing.T) {
+	// Arrange: the uploads succeed, the row does not.
+	repo := newRepo()
+	typeID := uuid.New()
+	repo.types[typeID] = true
+	repo.failCreate = errors.New("pq: deadlock detected")
+	reaper := &fakeReaper{}
+
+	input := validInput(typeID)
+	input.Gallery = []*multipart.FileHeader{fileHeader("a.jpg")}
+
+	// Act
+	_, err := newServiceWithReaper(repo, &fakeUploader{}, reaper).Create(context.Background(), input)
+
+	// Assert: nothing points at the assets, so none of them may survive.
+	require.Error(t, err)
+	assert.ElementsMatch(t, []string{"products/cover.jpg", "products/a.jpg"}, reaper.discarded)
 }
 
 func TestCreateReportsUnconfiguredStorageAsUnavailable(t *testing.T) {
@@ -323,7 +367,7 @@ func TestUpdateWithoutCoverKeepsTheStoredOne(t *testing.T) {
 	// Assert
 	require.NoError(t, err)
 	assert.Equal(t, 0, images.calls)
-	assert.Equal(t, "", repo.writes[0].CoverURL)
+	assert.Equal(t, "", repo.writes[0].Cover.URL)
 	assert.Equal(t, "https://cdn.test/products/old.jpg", updated.Image.ImagePath)
 }
 
@@ -349,6 +393,108 @@ func TestUpdateReplacesGalleryOnlyWhenAsked(t *testing.T) {
 	assert.True(t, repo.writes[0].ReplaceGallery)
 	require.Len(t, updated.ProductImages, 1)
 	assert.Equal(t, "https://cdn.test/products/new.jpg", updated.ProductImages[0].Image.ImagePath)
+}
+
+func TestUpdateDiscardsTheReplacedCoverOnlyAfterTheRowCommits(t *testing.T) {
+	// Arrange
+	repo := newRepo()
+	typeID := uuid.New()
+	repo.types[typeID] = true
+	id := uuid.New()
+	repo.items[id] = product.Product{
+		ID:   id,
+		Name: "Kopi Gayo",
+		Image: &product.Image{
+			ImagePath: "https://cdn.test/products/old.jpg",
+			PublicID:  "products/old.jpg",
+		},
+	}
+	reaper := &fakeReaper{}
+
+	// Act
+	updated, err := newServiceWithReaper(repo, &fakeUploader{}, reaper).
+		Update(context.Background(), id, validInput(typeID))
+
+	// Assert: the new cover is stored and the one it replaced is gone.
+	require.NoError(t, err)
+	assert.Equal(t, "products/cover.jpg", repo.writes[0].Cover.PublicID)
+	assert.Equal(t, "https://cdn.test/products/cover.jpg", updated.Image.ImagePath)
+	assert.Equal(t, []string{"products/old.jpg"}, reaper.discarded)
+}
+
+func TestUpdateDiscardsTheNewCoverWhenTheRowFails(t *testing.T) {
+	// Arrange
+	repo := newRepo()
+	typeID := uuid.New()
+	repo.types[typeID] = true
+	id := uuid.New()
+	repo.items[id] = product.Product{
+		ID:    id,
+		Name:  "Kopi Gayo",
+		Image: &product.Image{ImagePath: "https://cdn.test/products/old.jpg", PublicID: "products/old.jpg"},
+	}
+	repo.failUpdate = errors.New("pq: deadlock detected")
+	reaper := &fakeReaper{}
+
+	// Act
+	_, err := newServiceWithReaper(repo, &fakeUploader{}, reaper).
+		Update(context.Background(), id, validInput(typeID))
+
+	// Assert: the row still shows the old cover, so only the new one goes.
+	require.Error(t, err)
+	assert.Equal(t, []string{"products/cover.jpg"}, reaper.discarded)
+}
+
+func TestUpdateDiscardsEveryReplacedGalleryImage(t *testing.T) {
+	// Arrange
+	repo := newRepo()
+	typeID := uuid.New()
+	repo.types[typeID] = true
+	id := uuid.New()
+	repo.items[id] = product.Product{
+		ID:    id,
+		Name:  "Kopi Gayo",
+		Image: &product.Image{ImagePath: "old.jpg", PublicID: "products/old-cover.jpg"},
+		ProductImages: []product.GalleryImage{
+			{Image: &product.Image{ImagePath: "g1.jpg", PublicID: "products/old-g1.jpg"}},
+			{Image: &product.Image{ImagePath: "g2.jpg", PublicID: "products/old-g2.jpg"}},
+		},
+	}
+	reaper := &fakeReaper{}
+
+	input := validInput(typeID)
+	input.Cover = nil
+	input.ReplaceGallery = true
+	input.Gallery = []*multipart.FileHeader{fileHeader("new.jpg")}
+
+	// Act
+	_, err := newServiceWithReaper(repo, &fakeUploader{}, reaper).Update(context.Background(), id, input)
+
+	// Assert: the whole replaced gallery is dropped, and the kept cover is not.
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"products/old-g1.jpg", "products/old-g2.jpg"}, reaper.discarded)
+}
+
+func TestUpdateKeepsTheGalleryWhenItIsNotReplaced(t *testing.T) {
+	repo := newRepo()
+	typeID := uuid.New()
+	repo.types[typeID] = true
+	id := uuid.New()
+	repo.items[id] = product.Product{
+		ID:            id,
+		Name:          "Kopi Gayo",
+		ProductImages: []product.GalleryImage{{Image: &product.Image{ImagePath: "g1.jpg", PublicID: "products/old-g1.jpg"}}},
+	}
+	reaper := &fakeReaper{}
+
+	input := validInput(typeID)
+	input.Cover = nil
+	input.Gallery = []*multipart.FileHeader{fileHeader("new.jpg")}
+
+	_, err := newServiceWithReaper(repo, &fakeUploader{}, reaper).Update(context.Background(), id, input)
+
+	require.NoError(t, err)
+	assert.Empty(t, reaper.discarded)
 }
 
 func TestUpdateDoesNotChangeStatus(t *testing.T) {
@@ -420,6 +566,30 @@ func TestDelete(t *testing.T) {
 
 	err := service.Delete(context.Background(), id)
 	assert.Equal(t, http.StatusNotFound, statusOf(t, err))
+}
+
+func TestDeleteDiscardsTheCoverAndTheWholeGallery(t *testing.T) {
+	// Arrange
+	repo := newRepo()
+	id := uuid.New()
+	repo.items[id] = product.Product{
+		ID:    id,
+		Image: &product.Image{ImagePath: "cover.jpg", PublicID: "products/cover.jpg"},
+		ProductImages: []product.GalleryImage{
+			{Image: &product.Image{ImagePath: "a.jpg", PublicID: "products/a.jpg"}},
+			{Image: &product.Image{ImagePath: "b.jpg", PublicID: "products/b.jpg"}},
+		},
+	}
+	reaper := &fakeReaper{}
+
+	// Act
+	require.NoError(t, newServiceWithReaper(repo, &fakeUploader{}, reaper).Delete(context.Background(), id))
+
+	// Assert: the row is gone, so nothing can address these assets again.
+	assert.Empty(t, repo.items)
+	assert.ElementsMatch(t,
+		[]string{"products/cover.jpg", "products/a.jpg", "products/b.jpg"},
+		reaper.discarded)
 }
 
 func TestListHidesTheDriverError(t *testing.T) {
@@ -505,8 +675,8 @@ func TestHandlerCreateReadsCoverAndGalleryFields(t *testing.T) {
 	assert.Equal(t, "pcs", write.Unit)
 	assert.Equal(t, typeID, write.TypeProduct)
 	assert.Equal(t, product.StatusActive, write.Status)
-	assert.Equal(t, "https://cdn.test/products/cover.jpg", write.CoverURL)
-	assert.Len(t, write.GalleryURLs, 2)
+	assert.Equal(t, "https://cdn.test/products/cover.jpg", write.Cover.URL)
+	assert.Len(t, write.Gallery, 2)
 	assert.NotEqual(t, uuid.Nil, write.CreatedBy)
 }
 
@@ -557,8 +727,10 @@ func TestHandlerUpdateReadsNewCoverAndReplaceGallery(t *testing.T) {
 	// Assert
 	assert.Equal(t, http.StatusOK, w.Code)
 	require.Len(t, repo.writes, 1)
-	assert.Equal(t, "https://cdn.test/products/fresh.jpg", repo.writes[0].CoverURL)
-	assert.Equal(t, []string{"https://cdn.test/products/g1.jpg"}, repo.writes[0].GalleryURLs)
+	assert.Equal(t, "https://cdn.test/products/fresh.jpg", repo.writes[0].Cover.URL)
+	assert.Equal(t, []product.UploadedImage{
+		{URL: "https://cdn.test/products/g1.jpg", PublicID: "products/g1.jpg"},
+	}, repo.writes[0].Gallery)
 	assert.True(t, repo.writes[0].ReplaceGallery)
 }
 
@@ -578,8 +750,8 @@ func TestHandlerUpdateLeavesGalleryAloneWhenReplaceIsFalse(t *testing.T) {
 	require.NoError(t, handler.Update(httptest.NewRecorder(), r))
 
 	assert.False(t, repo.writes[0].ReplaceGallery)
-	assert.Empty(t, repo.writes[0].GalleryURLs)
-	assert.Empty(t, repo.writes[0].CoverURL)
+	assert.Empty(t, repo.writes[0].Gallery)
+	assert.Empty(t, repo.writes[0].Cover.URL)
 }
 
 // TestHandlerListEmitsTheKeysTheWebClientMaps guards the response contract:

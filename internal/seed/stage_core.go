@@ -38,16 +38,17 @@ func (s *Seeder) seedUsers(ctx context.Context, opts Options) error {
 
 func (s *Seeder) buildUser(u seedUser, hash string) model.User {
 	row := model.User{
-		ID:          id("user", u.Key),
-		Name:        u.Name,
-		Username:    optional(u.Username),
-		Email:       optional(strings.ToLower(u.Email)),
-		Phone:       optional(u.Phone),
-		Gender:      u.Gender,
-		RoleID:      id("role", u.Role),
-		Status:      1,
-		DateOfBirth: ptr(s.now.AddDate(-30, 0, 0)),
-		Photo:       fmt.Sprintf("https://cdn.nusantara.test/avatars/%s.jpg", u.Key),
+		ID:            id("user", u.Key),
+		Name:          u.Name,
+		Username:      optional(u.Username),
+		Email:         optional(strings.ToLower(u.Email)),
+		Phone:         optional(u.Phone),
+		Gender:        u.Gender,
+		RoleID:        id("role", u.Role),
+		Status:        1,
+		DateOfBirth:   ptr(s.now.AddDate(-30, 0, 0)),
+		Photo:         assetURL(FolderAvatars, u.Key),
+		PhotoPublicID: assetPublicID(FolderAvatars, u.Key),
 	}
 
 	// Only accounts that list the password provider get a hash; the others
@@ -156,18 +157,21 @@ func (s *Seeder) seedImages(ctx context.Context, _ Options) error {
 		images = append(images,
 			model.Image{
 				ID:        id("image", "product:"+p.Key),
-				ImagePath: fmt.Sprintf("https://cdn.nusantara.test/products/%s.jpg", p.Key),
+				ImagePath: assetURL(FolderProducts, p.Key),
+				PublicID:  assetPublicID(FolderProducts, p.Key),
 			},
 			model.Image{
 				ID:        id("image", "product-alt:"+p.Key),
-				ImagePath: fmt.Sprintf("https://cdn.nusantara.test/products/%s-2.jpg", p.Key),
+				ImagePath: assetURL(FolderProducts, p.Key+"-2"),
+				PublicID:  assetPublicID(FolderProducts, p.Key+"-2"),
 			})
 	}
 
 	for _, shop := range seedShops {
 		images = append(images, model.Image{
 			ID:        id("image", "shop:"+shop.Key),
-			ImagePath: fmt.Sprintf("https://cdn.nusantara.test/shops/%s.jpg", shop.Key),
+			ImagePath: assetURL(FolderShops, shop.Key),
+			PublicID:  assetPublicID(FolderShops, shop.Key),
 		})
 	}
 
@@ -181,11 +185,12 @@ func (s *Seeder) seedCatalog(ctx context.Context, _ Options) error {
 	types := make([]model.TypeProduct, 0, len(seedTypeProducts))
 	for _, t := range seedTypeProducts {
 		types = append(types, model.TypeProduct{
-			ID:     id("type", t.Key),
-			Name:   t.Name,
-			Image:  t.Image,
-			Status: 1,
-			UserID: adminID,
+			ID:            id("type", t.Key),
+			Name:          t.Name,
+			Image:         assetURL(FolderTypes, t.Key),
+			ImagePublicID: assetPublicID(FolderTypes, t.Key),
+			Status:        1,
+			UserID:        adminID,
 		})
 	}
 	if err := upsert(ctx, s.db, types); err != nil {

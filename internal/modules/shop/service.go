@@ -21,15 +21,23 @@ type uploader interface {
 	Upload(ctx context.Context, file *multipart.FileHeader, folder string) (storage.Uploaded, error)
 }
 
+// reaper removes assets a record no longer points at. It is an interface so a
+// test can assert that a replaced cover or gallery is actually cleaned up.
+type reaper interface {
+	Discard(ctx context.Context, publicID string)
+	DiscardAll(ctx context.Context, publicIDs []string)
+}
+
 // Service holds the business rules.
 type Service struct {
 	repo   Repository
 	images uploader
+	reaper reaper
 	log    *slog.Logger
 }
 
-func NewService(repo Repository, images uploader, log *slog.Logger) *Service {
-	return &Service{repo: repo, images: images, log: log}
+func NewService(repo Repository, images uploader, reaper reaper, log *slog.Logger) *Service {
+	return &Service{repo: repo, images: images, reaper: reaper, log: log}
 }
 
 // List returns one page of shops.
@@ -76,18 +84,21 @@ func (s *Service) Create(ctx context.Context, input Input) (Shop, error) {
 
 	gallery, err := s.uploadGallery(ctx, input.Gallery)
 	if err != nil {
+		// The cover is already stored and no row will ever point at it.
+		s.reaper.Discard(ctx, cover.PublicID)
 		return Shop{}, err
 	}
 
 	created, err := s.repo.Create(ctx, Record{
-		Name:        input.Name,
-		Description: input.Description,
-		FullAddress: input.FullAddress,
-		Lat:         input.Lat,
-		Lng:         input.Lng,
-		Status:      normalizeStatus(input.Status),
-		Cover:       cover,
-		CreatedBy:   input.CreatedBy,
+		Name:          input.Name,
+		Description:   input.Description,
+		FullAddress:   input.FullAddress,
+		Lat:           input.Lat,
+		Lng:           input.Lng,
+		Status:        normalizeStatus(input.Status),
+		Cover:         cover.URL,
+		CoverPublicID: cover.PublicID,
+		CreatedBy:     input.CreatedBy,
 	}, Assignments{
 		Gallery: gallery,
 		// A new shop has nothing to replace, and both relations are always
@@ -98,6 +109,9 @@ func (s *Service) Create(ctx context.Context, input Input) (Shop, error) {
 		SetProducts: true,
 	})
 	if err != nil {
+		// The uploads already happened, so a failed insert would strand them.
+		s.reaper.Discard(ctx, cover.PublicID)
+		s.reaper.DiscardAll(ctx, publicIDs(gallery))
 		return Shop{}, httpx.Internal("failed to create shop").WithCause(err)
 	}
 	return created, nil
@@ -106,7 +120,8 @@ func (s *Service) Create(ctx context.Context, input Input) (Shop, error) {
 // Update edits a shop. Fields the caller omitted keep their stored value, and
 // the staff and stock lists are replaced rather than appended to.
 func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (Shop, error) {
-	if _, err := s.repo.FindByID(ctx, id); err != nil {
+	existing, err := s.repo.FindByID(ctx, id)
+	if err != nil {
 		return Shop{}, s.translate(err, "failed to load shop")
 	}
 
@@ -116,17 +131,14 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (Shop, 
 		}
 	}
 
-	var (
-		lines []ProductLine
-		err   error
-	)
+	var lines []ProductLine
 	if input.SetProducts {
 		if lines, err = s.resolveProducts(ctx, input.Products); err != nil {
 			return Shop{}, err
 		}
 	}
 
-	cover := ""
+	var cover storage.Uploaded
 	if input.Cover != nil {
 		if cover, err = s.upload(ctx, input.Cover, "cover"); err != nil {
 			return Shop{}, err
@@ -135,16 +147,18 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (Shop, 
 
 	gallery, err := s.uploadGallery(ctx, input.Gallery)
 	if err != nil {
+		s.reaper.Discard(ctx, cover.PublicID)
 		return Shop{}, err
 	}
 
 	updated, err := s.repo.Update(ctx, id, Record{
-		Name:        input.Name,
-		Description: input.Description,
-		FullAddress: input.FullAddress,
-		Lat:         input.Lat,
-		Lng:         input.Lng,
-		Cover:       cover,
+		Name:          input.Name,
+		Description:   input.Description,
+		FullAddress:   input.FullAddress,
+		Lat:           input.Lat,
+		Lng:           input.Lng,
+		Cover:         cover.URL,
+		CoverPublicID: cover.PublicID,
 	}, Assignments{
 		Gallery:        gallery,
 		ReplaceGallery: input.ReplaceGallery,
@@ -154,7 +168,19 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (Shop, 
 		SetProducts:    input.SetProducts,
 	})
 	if err != nil {
+		// The row still points at the old pictures, so the new ones are stranded.
+		s.reaper.Discard(ctx, cover.PublicID)
+		s.reaper.DiscardAll(ctx, publicIDs(gallery))
 		return Shop{}, s.translate(err, "failed to update shop")
+	}
+
+	// Only once the row commits to the new pictures are the old ones safe to
+	// drop -- and only the ones the write actually replaced.
+	if cover.PublicID != "" {
+		s.reaper.Discard(ctx, existing.CoverPublicID)
+	}
+	if input.ReplaceGallery {
+		s.reaper.DiscardAll(ctx, existing.GalleryPublicIDs)
 	}
 	return updated, nil
 }
@@ -168,6 +194,10 @@ func (s *Service) SetStatus(ctx context.Context, id uuid.UUID, status int) error
 }
 
 // Delete removes a shop, refusing while orders still reference it.
+//
+// The row is read first because deleting it is what makes its pictures
+// unreachable: nothing else in the system records the handles, so the only
+// moment they can still be found is before the row goes.
 func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
 	hasOrders, err := s.repo.HasOrders(ctx, id)
 	if err != nil {
@@ -179,9 +209,20 @@ func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
 		return httpx.Conflict("this shop still has orders; close it instead of deleting it")
 	}
 
+	existing, err := s.repo.FindByID(ctx, id)
+	if err != nil {
+		return s.translate(err, "failed to load shop")
+	}
+
 	if err := s.repo.Delete(ctx, id); err != nil {
 		return s.translate(err, "failed to delete shop")
 	}
+
+	// The delete is a soft delete, but no endpoint restores a shop, and the
+	// gallery join rows are deleted with it, so the pictures are unreachable
+	// from here on and keeping them only leaks storage.
+	s.reaper.Discard(ctx, existing.CoverPublicID)
+	s.reaper.DiscardAll(ctx, existing.GalleryPublicIDs)
 	return nil
 }
 
@@ -325,33 +366,46 @@ func (s *Service) resolveProducts(ctx context.Context, assignments []ProductAssi
 	return lines, nil
 }
 
-func (s *Service) uploadGallery(ctx context.Context, files []*multipart.FileHeader) ([]string, error) {
-	urls := make([]string, 0, len(files))
+// uploadGallery stores every gallery file, or none of them: a file rejected
+// halfway through would otherwise leave the ones before it with nothing to
+// point at them.
+func (s *Service) uploadGallery(ctx context.Context, files []*multipart.FileHeader) ([]GalleryImage, error) {
+	images := make([]GalleryImage, 0, len(files))
 	for i, file := range files {
 		if file == nil {
 			continue
 		}
-		url, err := s.upload(ctx, file, "gallery."+strconv.Itoa(i))
+		uploaded, err := s.upload(ctx, file, "gallery."+strconv.Itoa(i))
 		if err != nil {
+			s.reaper.DiscardAll(ctx, publicIDs(images))
 			return nil, err
 		}
-		urls = append(urls, url)
+		images = append(images, GalleryImage{URL: uploaded.URL, PublicID: uploaded.PublicID})
 	}
-	return urls, nil
+	return images, nil
 }
 
-func (s *Service) upload(ctx context.Context, file *multipart.FileHeader, field string) (string, error) {
+func (s *Service) upload(ctx context.Context, file *multipart.FileHeader, field string) (storage.Uploaded, error) {
 	uploaded, err := s.images.Upload(ctx, file, imageFolder)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotConfigured) {
-			return "", httpx.Unavailable("image uploads are not configured on this server").WithCause(err)
+			return storage.Uploaded{}, httpx.Unavailable("image uploads are not configured on this server").WithCause(err)
 		}
 		// A rejected file is the caller's problem; anything else is ours.
-		return "", httpx.Validation("request validation failed").
+		return storage.Uploaded{}, httpx.Validation("request validation failed").
 			WithDetails([]httpx.FieldError{{Field: field, Message: err.Error()}}).
 			WithCause(err)
 	}
-	return uploaded.URL, nil
+	return uploaded, nil
+}
+
+// publicIDs pulls the storage handles out of a set of gallery pictures.
+func publicIDs(images []GalleryImage) []string {
+	ids := make([]string, 0, len(images))
+	for _, image := range images {
+		ids = append(ids, image.PublicID)
+	}
+	return ids
 }
 
 // translate turns a repository error into the right HTTP status.

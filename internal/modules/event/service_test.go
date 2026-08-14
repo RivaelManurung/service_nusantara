@@ -3,6 +3,7 @@ package event_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -33,6 +34,10 @@ type fakeRepo struct {
 	created  event.Children
 	updated  event.Children
 	failWith error
+
+	// failWrite makes Create and Update fail the way a constraint violation
+	// would, which is the case that strands a just-uploaded cover.
+	failWrite error
 }
 
 func newRepo() *fakeRepo {
@@ -78,6 +83,9 @@ func (f *fakeRepo) ProductPrices(_ context.Context, ids []uuid.UUID) (map[uuid.U
 }
 
 func (f *fakeRepo) Create(_ context.Context, row event.Event, children event.Children, _ uuid.UUID) (event.Event, error) {
+	if f.failWrite != nil {
+		return event.Event{}, f.failWrite
+	}
 	f.created = children
 	f.events[row.ID] = row
 	f.children[row.ID] = children
@@ -85,11 +93,20 @@ func (f *fakeRepo) Create(_ context.Context, row event.Event, children event.Chi
 }
 
 func (f *fakeRepo) Update(_ context.Context, id uuid.UUID, row event.Event, children event.Children) (event.Event, error) {
-	if _, ok := f.events[id]; !ok {
+	stored, ok := f.events[id]
+	if !ok {
 		return event.Event{}, event.ErrNotFound
+	}
+	if f.failWrite != nil {
+		return event.Event{}, f.failWrite
 	}
 	f.updated = children
 	row.ID = id
+	// An empty cover means "keep the stored one", and the handle moves with it.
+	if row.Cover == "" {
+		row.Cover = stored.Cover
+		row.CoverPublicID = stored.CoverPublicID
+	}
 	f.events[id] = row
 	// Replace, never append.
 	f.children[id] = children
@@ -118,6 +135,9 @@ func (f *fakeRepo) Delete(_ context.Context, id uuid.UUID) error {
 type fakeUploader struct {
 	calls int
 	err   error
+	// publicID is handed out with an incrementing suffix, so a test can tell the
+	// replacement apart from the picture it replaced.
+	publicID string
 }
 
 func (f *fakeUploader) Upload(context.Context, *multipart.FileHeader, string) (storage.Uploaded, error) {
@@ -125,13 +145,37 @@ func (f *fakeUploader) Upload(context.Context, *multipart.FileHeader, string) (s
 	if f.err != nil {
 		return storage.Uploaded{}, f.err
 	}
-	return storage.Uploaded{URL: "https://cdn.example/cover.jpg", PublicID: "cover"}, nil
+	id := f.publicID
+	if id == "" {
+		id = "cover"
+	}
+	return storage.Uploaded{
+		URL:      "https://cdn.example/cover.jpg",
+		PublicID: fmt.Sprintf("%s-%d", id, f.calls),
+	}, nil
+}
+
+// fakeReaper records what the service asked to have deleted.
+type fakeReaper struct {
+	discarded []string
+}
+
+func (f *fakeReaper) Discard(_ context.Context, publicID string) {
+	if publicID == "" {
+		return
+	}
+	f.discarded = append(f.discarded, publicID)
 }
 
 // --- helpers -----------------------------------------------------------
 
 func newService(repo *fakeRepo, images *fakeUploader) *event.Service {
-	return event.NewService(repo, images, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return event.NewService(repo, images, &fakeReaper{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// newReapingService is newService with a reaper the caller can inspect.
+func newReapingService(repo *fakeRepo, images *fakeUploader, reaper *fakeReaper) *event.Service {
+	return event.NewService(repo, images, reaper, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func aCover() *multipart.FileHeader {
@@ -367,7 +411,10 @@ func TestUpdateKeepsTheStoredCoverWhenNoFileIsSent(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, 1, images.calls, "the cover must not be re-uploaded")
-	assert.Empty(t, updated.Cover, "an empty cover tells the repository to keep the stored one")
+	assert.Equal(t, created.Cover, updated.Cover,
+		"an empty cover tells the repository to keep the stored one")
+	assert.Equal(t, created.CoverPublicID, updated.CoverPublicID,
+		"the handle stays with the picture it addresses")
 }
 
 func TestUpdateReportsAMissingEventAsNotFound(t *testing.T) {
@@ -391,6 +438,121 @@ func TestSetStatusClampsAnOutOfRangeValue(t *testing.T) {
 
 	require.NoError(t, service.SetStatus(context.Background(), created.ID, 7))
 	assert.Equal(t, event.StatusInactive, repo.events[created.ID].Status)
+}
+
+// --- image cleanup -----------------------------------------------------
+//
+// Nothing but the row records the storage handle, so every path that stops
+// pointing at a cover has to hand it to the reaper or the asset leaks forever.
+
+func TestCreatePersistsTheStorageHandle(t *testing.T) {
+	// Arrange
+	productID := uuid.New()
+	repo := newRepo()
+	repo.prices[productID] = 10_000
+
+	// Act
+	created, err := newService(repo, &fakeUploader{}).
+		Create(context.Background(), discountInput(productID))
+
+	// Assert
+	require.NoError(t, err)
+	assert.Equal(t, "cover-1", repo.events[created.ID].CoverPublicID,
+		"the handle is the only thing that can delete the asset later")
+}
+
+func TestCreateDiscardsTheUploadWhenTheInsertFails(t *testing.T) {
+	// Arrange
+	productID := uuid.New()
+	repo := newRepo()
+	repo.prices[productID] = 10_000
+	repo.failWrite = errors.New("pq: duplicate key value violates unique constraint")
+	reaper := &fakeReaper{}
+
+	// Act
+	_, err := newReapingService(repo, &fakeUploader{}, reaper).
+		Create(context.Background(), discountInput(productID))
+
+	// Assert
+	require.Error(t, err)
+	assert.Equal(t, []string{"cover-1"}, reaper.discarded,
+		"no row points at the upload, so it must not be left behind")
+}
+
+func TestUpdateDiscardsTheOldCoverOnlyAfterTheRowCommits(t *testing.T) {
+	// Arrange
+	productID := uuid.New()
+	repo := newRepo()
+	repo.prices[productID] = 10_000
+	images := &fakeUploader{}
+	reaper := &fakeReaper{}
+	service := newReapingService(repo, images, reaper)
+
+	created, err := service.Create(context.Background(), discountInput(productID))
+	require.NoError(t, err)
+	require.Empty(t, reaper.discarded)
+
+	// Act: a second cover replaces the first.
+	_, err = service.Update(context.Background(), created.ID, discountInput(productID))
+
+	// Assert
+	require.NoError(t, err)
+	assert.Equal(t, []string{"cover-1"}, reaper.discarded, "the replaced cover is dropped")
+	assert.Equal(t, "cover-2", repo.events[created.ID].CoverPublicID)
+}
+
+func TestUpdateDiscardsTheNewCoverWhenTheWriteFails(t *testing.T) {
+	// Arrange
+	productID := uuid.New()
+	repo := newRepo()
+	repo.prices[productID] = 10_000
+	images := &fakeUploader{}
+	reaper := &fakeReaper{}
+	service := newReapingService(repo, images, reaper)
+
+	created, err := service.Create(context.Background(), discountInput(productID))
+	require.NoError(t, err)
+	repo.failWrite = errors.New("pq: deadlock detected")
+
+	// Act
+	_, err = service.Update(context.Background(), created.ID, discountInput(productID))
+
+	// Assert
+	require.Error(t, err)
+	assert.Equal(t, []string{"cover-2"}, reaper.discarded,
+		"the row still shows the old cover, so it is the new upload that is stranded")
+}
+
+func TestUpdateKeepingTheCoverDiscardsNothing(t *testing.T) {
+	productID := uuid.New()
+	repo := newRepo()
+	repo.prices[productID] = 10_000
+	reaper := &fakeReaper{}
+	service := newReapingService(repo, &fakeUploader{}, reaper)
+
+	created, err := service.Create(context.Background(), discountInput(productID))
+	require.NoError(t, err)
+
+	next := discountInput(productID)
+	next.Cover = nil
+	_, err = service.Update(context.Background(), created.ID, next)
+
+	require.NoError(t, err)
+	assert.Empty(t, reaper.discarded, "the row still points at that cover")
+}
+
+func TestDeleteDiscardsTheCover(t *testing.T) {
+	productID := uuid.New()
+	repo := newRepo()
+	repo.prices[productID] = 10_000
+	reaper := &fakeReaper{}
+	service := newReapingService(repo, &fakeUploader{}, reaper)
+
+	created, err := service.Create(context.Background(), discountInput(productID))
+	require.NoError(t, err)
+
+	require.NoError(t, service.Delete(context.Background(), created.ID))
+	assert.Equal(t, []string{"cover-1"}, reaper.discarded)
 }
 
 func TestDeleteReportsAMissingEventAsNotFound(t *testing.T) {

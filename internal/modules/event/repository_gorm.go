@@ -120,14 +120,15 @@ func (r *GormRepository) ProductPrices(ctx context.Context, ids []uuid.UUID) (ma
 
 func (r *GormRepository) Create(ctx context.Context, row Event, children Children, createdBy uuid.UUID) (Event, error) {
 	record := model.Event{
-		ID:        row.ID,
-		Name:      row.Name,
-		TypeEvent: model.EventType(row.TypeEvent),
-		StartDate: row.StartDate,
-		EndDate:   row.EndDate,
-		Cover:     row.Cover,
-		Status:    row.Status,
-		CreatedBy: createdBy,
+		ID:            row.ID,
+		Name:          row.Name,
+		TypeEvent:     model.EventType(row.TypeEvent),
+		StartDate:     row.StartDate,
+		EndDate:       row.EndDate,
+		Cover:         row.Cover,
+		CoverPublicID: row.CoverPublicID,
+		Status:        row.Status,
+		CreatedBy:     createdBy,
 	}
 
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -152,8 +153,11 @@ func (r *GormRepository) Update(ctx context.Context, id uuid.UUID, row Event, ch
 		"updated_at": time.Now().UTC(),
 	}
 	// An empty cover means "keep the existing one", so it must not be written.
+	// The public id moves with the URL: writing one without the other would
+	// leave a handle pointing at an asset the record no longer shows.
 	if row.Cover != "" {
 		updates["cover"] = row.Cover
+		updates["cover_public_id"] = row.CoverPublicID
 	}
 
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -405,6 +409,7 @@ func toEvent(row model.Event) Event {
 		StartDate:          row.StartDate,
 		EndDate:            row.EndDate,
 		Cover:              row.Cover,
+		CoverPublicID:      row.CoverPublicID,
 		Status:             row.Status,
 		EventProducts:      []ProductDiscount{},
 		EventBundleBuys:    []BundleItem{},

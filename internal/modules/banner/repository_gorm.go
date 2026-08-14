@@ -97,12 +97,13 @@ func (r *GormRepository) ExistsByName(ctx context.Context, name string, excludeI
 
 func (r *GormRepository) Create(ctx context.Context, row Banner, createdBy uuid.UUID) (Banner, error) {
 	record := model.Banner{
-		ID:          row.ID,
-		Name:        row.Name,
-		Photo:       row.Photo,
-		Description: row.Description,
-		Status:      row.Status,
-		UserID:      createdBy,
+		ID:            row.ID,
+		Name:          row.Name,
+		Photo:         row.Photo,
+		PhotoPublicID: row.PhotoPublicID,
+		Description:   row.Description,
+		Status:        row.Status,
+		UserID:        createdBy,
 	}
 	if err := r.db.WithContext(ctx).Create(&record).Error; err != nil {
 		return Banner{}, fmt.Errorf("create banner: %w", err)
@@ -110,15 +111,18 @@ func (r *GormRepository) Create(ctx context.Context, row Banner, createdBy uuid.
 	return toBanner(record), nil
 }
 
-func (r *GormRepository) Update(ctx context.Context, id uuid.UUID, name, description, photo string) (Banner, error) {
+func (r *GormRepository) Update(ctx context.Context, id uuid.UUID, name, description, photo, photoPublicID string) (Banner, error) {
 	updates := map[string]any{
 		"name":        name,
 		"description": description,
 		"updated_at":  time.Now().UTC(),
 	}
 	// An empty photo means "keep the existing one", so it must not be written.
+	// The public id moves with the URL: writing one without the other would
+	// leave a handle pointing at an asset the record no longer shows.
 	if photo != "" {
 		updates["photo"] = photo
+		updates["photo_public_id"] = photoPublicID
 	}
 
 	result := r.db.WithContext(ctx).Model(&model.Banner{}).Where("id = ?", id).Updates(updates)
@@ -173,13 +177,14 @@ func toBanners(rows []model.Banner) []Banner {
 
 func toBanner(row model.Banner) Banner {
 	return Banner{
-		ID:          row.ID,
-		Name:        row.Name,
-		Photo:       row.Photo,
-		Description: row.Description,
-		Status:      row.Status,
-		CreatedAt:   row.CreatedAt,
-		UpdatedAt:   row.UpdatedAt,
+		ID:            row.ID,
+		Name:          row.Name,
+		Photo:         row.Photo,
+		PhotoPublicID: row.PhotoPublicID,
+		Description:   row.Description,
+		Status:        row.Status,
+		CreatedAt:     row.CreatedAt,
+		UpdatedAt:     row.UpdatedAt,
 	}
 }
 

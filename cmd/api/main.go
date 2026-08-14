@@ -70,13 +70,17 @@ func run() error {
 	}()
 
 	if cfg.Postgres.AutoMigrate {
-		log.Warn("running AutoMigrate; use reviewed SQL migrations outside development")
+		// Kept for a scratch database only. The schema of record is the SQL
+		// history under internal/platform/database/migrations, applied by
+		// `make migrate`; AutoMigrate never drops or renames, so it drifts from
+		// the models without saying so.
+		log.Warn("running AutoMigrate; the schema of record is the SQL migrations, applied with `make migrate`")
 		if err := model.AutoMigrate(startupCtx, db); err != nil {
 			// The previous main discarded this error, so the service would come
 			// up and then fail on the first query against a missing column.
 			return err
 		}
-		log.Info("schema migrated")
+		log.Info("schema synced")
 	}
 
 	return server.New(cfg, db, rdb, log).Run(ctx)

@@ -3,6 +3,7 @@ package shop_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -33,6 +34,9 @@ type fakeRepo struct {
 
 	hasOrders bool
 	failWith  error
+	// failWrite makes Create and Update fail the way a constraint violation
+	// would, which is the case that strands a just-uploaded picture.
+	failWrite error
 
 	createdRecord shop.Record
 	createdAssign shop.Assignments
@@ -71,31 +75,70 @@ func (f *fakeRepo) FindByID(_ context.Context, id uuid.UUID) (shop.Shop, error) 
 }
 
 func (f *fakeRepo) Create(_ context.Context, record shop.Record, assign shop.Assignments) (shop.Shop, error) {
+	if f.failWrite != nil {
+		return shop.Shop{}, f.failWrite
+	}
 	f.creates++
 	f.createdRecord = record
 	f.createdAssign = assign
 
-	created := shop.Shop{ID: uuid.New(), Name: record.Name, Cover: record.Cover, Status: record.Status}
+	created := shop.Shop{
+		ID:               uuid.New(),
+		Name:             record.Name,
+		Cover:            record.Cover,
+		Status:           record.Status,
+		CoverPublicID:    record.CoverPublicID,
+		ShopImages:       galleryURLs(assign.Gallery),
+		GalleryPublicIDs: galleryPublicIDs(assign.Gallery),
+	}
 	f.shops[created.ID] = created
 	return created, nil
 }
 
 func (f *fakeRepo) Update(_ context.Context, id uuid.UUID, record shop.Record, assign shop.Assignments) (shop.Shop, error) {
-	f.updates++
-	f.updatedAssign = assign
-
 	item, ok := f.shops[id]
 	if !ok {
 		return shop.Shop{}, shop.ErrNotFound
 	}
+	if f.failWrite != nil {
+		return shop.Shop{}, f.failWrite
+	}
+	f.updates++
+	f.updatedAssign = assign
+
 	if record.Name != "" {
 		item.Name = record.Name
 	}
+	// An empty cover means "keep the stored one", and the handle moves with it.
 	if record.Cover != "" {
 		item.Cover = record.Cover
+		item.CoverPublicID = record.CoverPublicID
 	}
+	if assign.ReplaceGallery {
+		item.ShopImages = nil
+		item.GalleryPublicIDs = nil
+	}
+	item.ShopImages = append(item.ShopImages, galleryURLs(assign.Gallery)...)
+	item.GalleryPublicIDs = append(item.GalleryPublicIDs, galleryPublicIDs(assign.Gallery)...)
+
 	f.shops[id] = item
 	return item, nil
+}
+
+func galleryURLs(images []shop.GalleryImage) []string {
+	urls := make([]string, 0, len(images))
+	for _, image := range images {
+		urls = append(urls, image.URL)
+	}
+	return urls
+}
+
+func galleryPublicIDs(images []shop.GalleryImage) []string {
+	ids := make([]string, 0, len(images))
+	for _, image := range images {
+		ids = append(ids, image.PublicID)
+	}
+	return ids
 }
 
 func (f *fakeRepo) UpdateStatus(_ context.Context, id uuid.UUID, status int) error {
@@ -170,18 +213,49 @@ func (f *fakeRepo) AssignedShopProducts(_ context.Context, staffID, shopID uuid.
 type fakeUploader struct {
 	calls int
 	err   error
+	// failAfter lets a test upload the cover successfully and then fail on a
+	// gallery file, which is the case that strands a half-finished upload set.
+	failAfter int
 }
 
 func (f *fakeUploader) Upload(context.Context, *multipart.FileHeader, string) (storage.Uploaded, error) {
 	f.calls++
-	if f.err != nil {
+	if f.err != nil && f.calls > f.failAfter {
 		return storage.Uploaded{}, f.err
 	}
-	return storage.Uploaded{URL: "https://cdn.test/image.jpg", PublicID: "image"}, nil
+	// The suffix makes every upload distinguishable, so a test can name exactly
+	// which handle should have been discarded.
+	return storage.Uploaded{
+		URL:      fmt.Sprintf("https://cdn.test/image-%d.jpg", f.calls),
+		PublicID: fmt.Sprintf("image-%d", f.calls),
+	}, nil
+}
+
+// fakeReaper records what the service asked to have deleted.
+type fakeReaper struct {
+	discarded []string
+}
+
+func (f *fakeReaper) Discard(_ context.Context, publicID string) {
+	if publicID == "" {
+		return
+	}
+	f.discarded = append(f.discarded, publicID)
+}
+
+func (f *fakeReaper) DiscardAll(ctx context.Context, publicIDs []string) {
+	for _, id := range publicIDs {
+		f.Discard(ctx, id)
+	}
 }
 
 func newService(repo *fakeRepo, images *fakeUploader) *shop.Service {
-	return shop.NewService(repo, images, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return shop.NewService(repo, images, &fakeReaper{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// newReapingService is newService with a reaper the caller can inspect.
+func newReapingService(repo *fakeRepo, images *fakeUploader, reaper *fakeReaper) *shop.Service {
+	return shop.NewService(repo, images, reaper, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func anyFile() *multipart.FileHeader {
@@ -224,7 +298,7 @@ func TestCreateStoresTheResolvedAssignments(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "Toko Malioboro", created.Name)
 	assert.Equal(t, 3, images.calls, "cover plus both gallery files are uploaded")
-	assert.Equal(t, "https://cdn.test/image.jpg", repo.createdRecord.Cover)
+	assert.Equal(t, "https://cdn.test/image-1.jpg", repo.createdRecord.Cover)
 	assert.Len(t, repo.createdAssign.Gallery, 2)
 	assert.Equal(t, []uuid.UUID{cashierID}, repo.createdAssign.Cashiers)
 	require.Len(t, repo.createdAssign.Products, 1)
@@ -415,6 +489,168 @@ func TestDeleteReportsAMissingShopAsNotFound(t *testing.T) {
 	err := newService(repo, &fakeUploader{}).Delete(context.Background(), uuid.New())
 
 	assert.Equal(t, http.StatusNotFound, statusOf(t, err))
+}
+
+// --- image cleanup -----------------------------------------------------
+//
+// Nothing but the row records a storage handle, so every path that stops
+// pointing at a picture has to hand it to the reaper or the asset leaks forever.
+
+func TestCreatePersistsTheStorageHandles(t *testing.T) {
+	// Arrange
+	repo := newFakeRepo()
+
+	// Act
+	_, err := newService(repo, &fakeUploader{}).Create(context.Background(), shop.Input{
+		Name:    "Toko Malioboro",
+		Cover:   anyFile(),
+		Gallery: []*multipart.FileHeader{anyFile(), anyFile()},
+	})
+
+	// Assert
+	require.NoError(t, err)
+	assert.Equal(t, "image-1", repo.createdRecord.CoverPublicID,
+		"the handle is the only thing that can delete the asset later")
+	assert.Equal(t, []string{"image-2", "image-3"}, galleryPublicIDs(repo.createdAssign.Gallery))
+}
+
+func TestCreateDiscardsEveryUploadWhenTheInsertFails(t *testing.T) {
+	// Arrange
+	repo := newFakeRepo()
+	repo.failWrite = errors.New("pq: duplicate key value violates unique constraint")
+	reaper := &fakeReaper{}
+
+	// Act
+	_, err := newReapingService(repo, &fakeUploader{}, reaper).
+		Create(context.Background(), shop.Input{
+			Name:    "Toko Malioboro",
+			Cover:   anyFile(),
+			Gallery: []*multipart.FileHeader{anyFile()},
+		})
+
+	// Assert
+	require.Error(t, err)
+	assert.ElementsMatch(t, []string{"image-1", "image-2"}, reaper.discarded,
+		"no row points at the uploads, so none may be left behind")
+}
+
+// A gallery file rejected halfway through leaves the files before it with
+// nothing to point at them.
+func TestCreateDiscardsEarlierUploadsWhenAGalleryFileIsRejected(t *testing.T) {
+	repo := newFakeRepo()
+	reaper := &fakeReaper{}
+	// The cover and the first gallery file succeed; the second is rejected.
+	images := &fakeUploader{err: errors.New("unsupported image type"), failAfter: 2}
+
+	_, err := newReapingService(repo, images, reaper).Create(context.Background(), shop.Input{
+		Name:    "Toko Malioboro",
+		Cover:   anyFile(),
+		Gallery: []*multipart.FileHeader{anyFile(), anyFile()},
+	})
+
+	require.Error(t, err)
+	assert.Zero(t, repo.creates)
+	assert.ElementsMatch(t, []string{"image-1", "image-2"}, reaper.discarded)
+}
+
+func TestUpdateDiscardsTheOldCoverOnlyAfterTheRowCommits(t *testing.T) {
+	// Arrange
+	repo := newFakeRepo()
+	id := uuid.New()
+	repo.shops[id] = shop.Shop{ID: id, Name: "Toko Braga", Cover: "https://cdn.test/old.jpg",
+		CoverPublicID: "old-cover"}
+	reaper := &fakeReaper{}
+
+	// Act
+	_, err := newReapingService(repo, &fakeUploader{}, reaper).
+		Update(context.Background(), id, shop.Input{Cover: anyFile()})
+
+	// Assert
+	require.NoError(t, err)
+	assert.Equal(t, []string{"old-cover"}, reaper.discarded, "the replaced cover is dropped")
+	assert.Equal(t, "image-1", repo.shops[id].CoverPublicID)
+}
+
+func TestUpdateDiscardsTheNewUploadsWhenTheWriteFails(t *testing.T) {
+	repo := newFakeRepo()
+	id := uuid.New()
+	repo.shops[id] = shop.Shop{ID: id, CoverPublicID: "old-cover",
+		GalleryPublicIDs: []string{"old-gallery"}}
+	repo.failWrite = errors.New("pq: deadlock detected")
+	reaper := &fakeReaper{}
+
+	_, err := newReapingService(repo, &fakeUploader{}, reaper).
+		Update(context.Background(), id, shop.Input{
+			Cover:          anyFile(),
+			Gallery:        []*multipart.FileHeader{anyFile()},
+			ReplaceGallery: true,
+		})
+
+	require.Error(t, err)
+	assert.ElementsMatch(t, []string{"image-1", "image-2"}, reaper.discarded,
+		"the row still shows the old pictures, so it is the new uploads that are stranded")
+	assert.NotContains(t, reaper.discarded, "old-cover")
+	assert.NotContains(t, reaper.discarded, "old-gallery")
+}
+
+// replace_gallery=true drops every picture it replaced, not just the cover.
+func TestUpdateReplacingTheGalleryDiscardsEveryReplacedPicture(t *testing.T) {
+	repo := newFakeRepo()
+	id := uuid.New()
+	repo.shops[id] = shop.Shop{ID: id, CoverPublicID: "old-cover",
+		GalleryPublicIDs: []string{"old-gallery-1", "old-gallery-2"}}
+	reaper := &fakeReaper{}
+
+	_, err := newReapingService(repo, &fakeUploader{}, reaper).
+		Update(context.Background(), id, shop.Input{
+			Gallery:        []*multipart.FileHeader{anyFile()},
+			ReplaceGallery: true,
+		})
+
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"old-gallery-1", "old-gallery-2"}, reaper.discarded)
+	assert.NotContains(t, reaper.discarded, "old-cover", "the cover was not replaced")
+}
+
+// Appending to the gallery replaces nothing, so nothing may be deleted.
+func TestUpdateAppendingToTheGalleryDiscardsNothing(t *testing.T) {
+	repo := newFakeRepo()
+	id := uuid.New()
+	repo.shops[id] = shop.Shop{ID: id, CoverPublicID: "old-cover",
+		GalleryPublicIDs: []string{"old-gallery"}}
+	reaper := &fakeReaper{}
+
+	_, err := newReapingService(repo, &fakeUploader{}, reaper).
+		Update(context.Background(), id, shop.Input{Gallery: []*multipart.FileHeader{anyFile()}})
+
+	require.NoError(t, err)
+	assert.Empty(t, reaper.discarded, "the row still points at all of them")
+}
+
+func TestDeleteDiscardsTheCoverAndTheWholeGallery(t *testing.T) {
+	repo := newFakeRepo()
+	id := uuid.New()
+	repo.shops[id] = shop.Shop{ID: id, CoverPublicID: "cover",
+		GalleryPublicIDs: []string{"gallery-1", "gallery-2"}}
+	reaper := &fakeReaper{}
+
+	require.NoError(t, newReapingService(repo, &fakeUploader{}, reaper).
+		Delete(context.Background(), id))
+
+	assert.ElementsMatch(t, []string{"cover", "gallery-1", "gallery-2"}, reaper.discarded)
+}
+
+func TestDeleteDiscardsNothingWhileOrdersReferenceTheShop(t *testing.T) {
+	repo := newFakeRepo()
+	id := uuid.New()
+	repo.shops[id] = shop.Shop{ID: id, CoverPublicID: "cover"}
+	repo.hasOrders = true
+	reaper := &fakeReaper{}
+
+	err := newReapingService(repo, &fakeUploader{}, reaper).Delete(context.Background(), id)
+
+	assert.Equal(t, http.StatusConflict, statusOf(t, err))
+	assert.Empty(t, reaper.discarded, "the shop still shows those pictures")
 }
 
 // --- cashier-scoped reads ----------------------------------------------

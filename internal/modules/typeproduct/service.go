@@ -20,15 +20,22 @@ type uploader interface {
 	Upload(ctx context.Context, file *multipart.FileHeader, folder string) (storage.Uploaded, error)
 }
 
+// reaper removes assets a record no longer points at. It is an interface so a
+// test can assert that a replaced image is actually cleaned up.
+type reaper interface {
+	Discard(ctx context.Context, publicID string)
+}
+
 // Service holds the business rules.
 type Service struct {
 	repo   Repository
 	images uploader
+	reaper reaper
 	log    *slog.Logger
 }
 
-func NewService(repo Repository, images uploader, log *slog.Logger) *Service {
-	return &Service{repo: repo, images: images, log: log}
+func NewService(repo Repository, images uploader, reaper reaper, log *slog.Logger) *Service {
+	return &Service{repo: repo, images: images, reaper: reaper, log: log}
 }
 
 // List returns one page of categories.
@@ -66,12 +73,15 @@ func (s *Service) Create(ctx context.Context, input Input) (TypeProduct, error) 
 	}
 
 	created, err := s.repo.Create(ctx, TypeProduct{
-		ID:     uuid.New(),
-		Name:   input.Name,
-		Image:  uploaded,
-		Status: normalizeStatus(input.Status),
+		ID:            uuid.New(),
+		Name:          input.Name,
+		Image:         uploaded.URL,
+		ImagePublicID: uploaded.PublicID,
+		Status:        normalizeStatus(input.Status),
 	}, input.CreatedBy)
 	if err != nil {
+		// The upload already happened, so a failed insert would strand it.
+		s.reaper.Discard(ctx, uploaded.PublicID)
 		return TypeProduct{}, httpx.Internal("failed to create type product").WithCause(err)
 	}
 	return created, nil
@@ -79,7 +89,8 @@ func (s *Service) Create(ctx context.Context, input Input) (TypeProduct, error) 
 
 // Update edits a category. Sending no file keeps the existing image.
 func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (TypeProduct, error) {
-	if _, err := s.repo.FindByID(ctx, id); err != nil {
+	existing, err := s.repo.FindByID(ctx, id)
+	if err != nil {
 		return TypeProduct{}, s.translate(err, "failed to load type product")
 	}
 
@@ -91,16 +102,23 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, input Input) (TypePr
 		return TypeProduct{}, httpx.Conflict("another type product already uses this name")
 	}
 
-	image := ""
+	var uploaded storage.Uploaded
 	if input.Image != nil {
-		if image, err = s.uploadImage(ctx, input.Image); err != nil {
+		if uploaded, err = s.uploadImage(ctx, input.Image); err != nil {
 			return TypeProduct{}, err
 		}
 	}
 
-	updated, err := s.repo.Update(ctx, id, input.Name, image)
+	updated, err := s.repo.Update(ctx, id, input.Name, uploaded.URL, uploaded.PublicID)
 	if err != nil {
+		// The row still points at the old image, so the new upload is stranded.
+		s.reaper.Discard(ctx, uploaded.PublicID)
 		return TypeProduct{}, s.translate(err, "failed to update type product")
+	}
+
+	// Only once the row commits to the new image is the old one safe to drop.
+	if uploaded.PublicID != "" {
+		s.reaper.Discard(ctx, existing.ImagePublicID)
 	}
 	return updated, nil
 }
@@ -125,27 +143,34 @@ func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
 		return httpx.Conflict("this type still has products; move or remove them first")
 	}
 
+	existing, err := s.repo.FindByID(ctx, id)
+	if err != nil {
+		return s.translate(err, "failed to load type product")
+	}
+
 	if err := s.repo.Delete(ctx, id); err != nil {
 		return s.translate(err, "failed to delete type product")
 	}
+
+	s.reaper.Discard(ctx, existing.ImagePublicID)
 	return nil
 }
 
-func (s *Service) uploadImage(ctx context.Context, file *multipart.FileHeader) (string, error) {
+func (s *Service) uploadImage(ctx context.Context, file *multipart.FileHeader) (storage.Uploaded, error) {
 	if file == nil {
-		return "", httpx.Validation("request validation failed").
+		return storage.Uploaded{}, httpx.Validation("request validation failed").
 			WithDetails([]httpx.FieldError{{Field: "image", Message: "is required"}})
 	}
 
 	uploaded, err := s.images.Upload(ctx, file, imageFolder)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotConfigured) {
-			return "", httpx.Unavailable("image uploads are not configured on this server").WithCause(err)
+			return storage.Uploaded{}, httpx.Unavailable("image uploads are not configured on this server").WithCause(err)
 		}
 		// A rejected file is the caller's problem; anything else is ours.
-		return "", httpx.BadRequest(err.Error()).WithCause(err)
+		return storage.Uploaded{}, httpx.BadRequest(err.Error()).WithCause(err)
 	}
-	return uploaded.URL, nil
+	return uploaded, nil
 }
 
 // translate turns a repository error into the right HTTP status.
