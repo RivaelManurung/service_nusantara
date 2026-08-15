@@ -32,6 +32,7 @@ type Config struct {
 	Social   Social
 	OTP      OTP
 	Storage  Storage
+	Push     Push
 	Limiter  Limiter
 	Log      Log
 }
@@ -136,6 +137,29 @@ func (s Storage) Configured() bool {
 	return s.CloudinaryCloudName != "" && s.CloudinaryAPIKey != "" && s.CloudinaryAPISecret != ""
 }
 
+// Push configures Firebase Cloud Messaging, which is how a promo written in
+// the back office reaches a phone's notification tray.
+type Push struct {
+	// Credentials is either the service account JSON itself or a path to it.
+	// Both are accepted because both deployments exist: a platform that injects
+	// the document into one variable, and a container that mounts the file.
+	Credentials string
+	// AndroidChannelID must match the channel the Flutter app creates.
+	// Android 8 and later drop a notification whose channel does not exist --
+	// silently, while FCM still reports the send as a success.
+	AndroidChannelID string
+	// Timeout bounds one request to Firebase.
+	Timeout time.Duration
+	// Concurrency is how many devices are contacted at once. FCM retired its
+	// batch endpoint, so a broadcast is one request per device.
+	Concurrency int
+}
+
+// Configured reports whether notifications can actually be delivered. When
+// false the broadcast endpoint still writes the inbox and says push was off,
+// rather than failing.
+func (p Push) Configured() bool { return p.Credentials != "" }
+
 type Limiter struct {
 	// Requests/Window is the global per-client budget.
 	Requests int
@@ -220,6 +244,12 @@ func Load() (Config, error) {
 			CloudinaryAPISecret: r.str("CLOUDINARY_API_SECRET", ""),
 			RootFolder:          r.str("CLOUDINARY_ROOT_FOLDER", "nusantara"),
 			Timeout:             r.duration("CLOUDINARY_TIMEOUT", 30*time.Second),
+		},
+		Push: Push{
+			Credentials:      r.str("FCM_CREDENTIALS", ""),
+			AndroidChannelID: r.str("FCM_ANDROID_CHANNEL_ID", "menara_notifications"),
+			Timeout:          r.duration("FCM_TIMEOUT", 15*time.Second),
+			Concurrency:      r.int("FCM_CONCURRENCY", 8),
 		},
 		Limiter: Limiter{
 			Requests:      r.int("RATE_LIMIT_REQUESTS", 120),

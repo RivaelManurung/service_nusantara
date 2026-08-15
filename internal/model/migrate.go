@@ -25,8 +25,10 @@ func All() []any {
 		&Cart{}, &CartItem{},
 		&Favorite{}, &FavoriteItem{},
 		&Order{}, &OrderItem{}, &OrderEvent{}, &OrderReward{}, &OrderVoucher{},
+		&OrderStatusHistory{},
+		&AccountAction{},
 		&Review{},
-		&Notification{},
+		&Notification{}, &NotificationBroadcast{}, &DeviceToken{},
 	}
 }
 

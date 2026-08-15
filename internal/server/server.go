@@ -21,10 +21,15 @@ import (
 	"service_nusantara/internal/middleware"
 	"service_nusantara/internal/modules/banner"
 	"service_nusantara/internal/modules/cashier"
+	"service_nusantara/internal/modules/customer"
 	"service_nusantara/internal/modules/customeraddress"
+	"service_nusantara/internal/modules/dashboard"
+	"service_nusantara/internal/modules/devicetoken"
 	"service_nusantara/internal/modules/event"
 	"service_nusantara/internal/modules/health"
 	"service_nusantara/internal/modules/notification"
+	"service_nusantara/internal/modules/order"
+	"service_nusantara/internal/modules/point"
 	"service_nusantara/internal/modules/product"
 	"service_nusantara/internal/modules/report"
 	"service_nusantara/internal/modules/review"
@@ -33,6 +38,7 @@ import (
 	"service_nusantara/internal/modules/typeproduct"
 	"service_nusantara/internal/modules/user"
 	"service_nusantara/internal/modules/voucher"
+	"service_nusantara/internal/platform/push"
 	"service_nusantara/internal/platform/storage"
 )
 
@@ -93,13 +99,27 @@ func New(cfg config.Config, db *gorm.DB, rdb *redis.Client, log *slog.Logger) *S
 		log.Warn("image uploads disabled", slog.String("reason", imagesErr.Error()))
 	}
 
+	pushes, pushErr := pushSender(cfg.Push)
+	if pushErr != nil {
+		// Not fatal, for the same reason image uploads are not: the inbox, the
+		// catalogue and checkout all still work. Only the tray notification is
+		// missing, and the broadcast endpoint reports that in its response
+		// instead of failing.
+		log.Warn("push notifications disabled", slog.String("reason", pushErr.Error()))
+	}
+
 	limit := limiter.Limit(cfg.HTTP.TrustProxyHeaders)
 
 	mux := http.NewServeMux()
 	health.NewHandler(db, rdb, cfg.App.Version).Register(mux)
 	user.Register(mux, apiPrefix, user.NewHandler(userService), authenticate, limit)
 
-	registerCatalogModules(mux, db, images, hasher, log, authenticate, limit)
+	// sessions and the access-token lifetime are threaded through because
+	// blocking an account must end the sessions it already holds -- see the
+	// customer module, and note that user.Refresh does not re-check
+	// users.status.
+	registerCatalogModules(mux, db, images, hasher, pushes, sessions,
+		tokens.AccessTTL(), log, authenticate, limit)
 
 	// Outermost first: an id and a logger must exist before anything can panic,
 	// and Recover must wrap everything that follows.
@@ -184,6 +204,13 @@ func registerCatalogModules(
 	// hasher is threaded through because creating a cashier creates a user
 	// account; hardcoding a bcrypt cost here would silently ignore BCRYPT_COST.
 	hasher *auth.Hasher,
+	// pushes is never nil: an unconfigured deployment gets push.Disabled, so
+	// the notification module has one code path rather than a nil check.
+	pushes push.Sender,
+	// sessions lets the customer module end an account's sessions when it is
+	// blocked; accessTTL bounds how long a revoked jti stays on the blacklist.
+	sessions *auth.SessionStore,
+	accessTTL time.Duration,
 	log *slog.Logger,
 	authenticate, limit middleware.Middleware,
 ) {
@@ -213,11 +240,67 @@ func registerCatalogModules(
 	roleService := role.NewService(role.NewGormRepository(db), log)
 	role.Register(mux, apiPrefix, role.NewHandler(roleService), authenticate, limit)
 
-	permissionService := role.NewPermissionService(role.NewGormRepository(db), role.NewGormPermissionRepository(db), log)
+	// One instance, used twice: as the store behind the permission screen and
+	// as the resolver RequirePermission consults on the broadcast route.
+	permissions := role.NewGormPermissionRepository(db)
+
+	permissionService := role.NewPermissionService(role.NewGormRepository(db), permissions, log)
 	role.RegisterPermissions(mux, apiPrefix, role.NewPermissionHandler(permissionService), authenticate, limit)
 
-	notificationService := notification.NewService(notification.NewGormRepository(db), log)
-	notification.Register(mux, apiPrefix, notification.NewHandler(notificationService), authenticate, limit)
+	devices := devicetoken.NewGormRepository(db)
+
+	notificationService := notification.NewService(notification.Deps{
+		Repo:    notification.NewGormRepository(db),
+		Logger:  log,
+		Devices: deviceRegistry{repo: devices},
+		Push:    pushes,
+	})
+	// Who may broadcast is a permission, not a role: see the catalogue entry
+	// notification.write ("Kirim notifikasi"). Superadmin holds every code, so
+	// this reads like the other back-office routes until an operator grants it
+	// to somebody else in the role screen.
+	notification.Register(mux, apiPrefix, notification.NewHandler(notificationService),
+		authenticate, limit, middleware.RequirePermission(permissions, role.PermNotificationWrite))
+
+	devicetoken.Register(mux, apiPrefix,
+		devicetoken.NewHandler(devicetoken.NewService(devices, log)),
+		authenticate, limit)
+
+	// Orders are the one back-office surface guarded by permission rather than
+	// by role, reusing the resolver built above. The catalogue has carried
+	// order.read and order.write since the permission screen shipped; until now
+	// nothing consulted them, so ticking "Kelola pesanan" changed nothing.
+	orderService := order.NewService(order.NewGormRepository(db), log)
+	order.Register(mux, apiPrefix, order.NewHandler(orderService), authenticate, limit,
+		middleware.RequirePermission(permissions, role.PermOrderRead),
+		middleware.RequirePermission(permissions, role.PermOrderWrite))
+
+	// Accounts, and the moderation of them. Blocking revokes every session the
+	// account holds, which is why this needs the session store: user.Refresh
+	// mints a new access token from a refresh token without re-checking
+	// users.status, so a block that did not revoke would not take effect until
+	// the refresh token expired.
+	customerService := customer.NewService(
+		customer.NewGormRepository(db), sessions, accessTTL, log)
+	customer.Register(mux, apiPrefix, customer.NewHandler(customerService), authenticate, limit,
+		middleware.RequirePermission(permissions, role.PermUserRead),
+		middleware.RequirePermission(permissions, role.PermUserWrite))
+
+	// Points are account data, so they share the account permissions. The
+	// voucher-claims view is voucher oversight and takes voucher.read instead.
+	pointService := point.NewService(point.NewGormRepository(db), log)
+	point.Register(mux, apiPrefix, point.NewHandler(pointService), authenticate, limit,
+		middleware.RequirePermission(permissions, role.PermUserRead),
+		middleware.RequirePermission(permissions, role.PermUserWrite),
+		middleware.RequirePermission(permissions, role.PermVoucherRead))
+
+	// The dashboard: today's figures, and the queue of accounts worth a look.
+	// Its two halves are guarded differently -- sales totals and a list of
+	// customers to investigate are not the same trust.
+	dashboardService := dashboard.NewService(dashboard.NewGormRepository(db), log)
+	dashboard.Register(mux, apiPrefix, dashboard.NewHandler(dashboardService), authenticate, limit,
+		middleware.RequirePermission(permissions, role.PermReportTransactionRead),
+		middleware.RequirePermission(permissions, role.PermUserRead))
 
 	reportService := report.NewService(report.NewGormRepository(db), log)
 	report.Register(mux, apiPrefix, report.NewHandler(reportService), authenticate, limit)
